@@ -222,7 +222,12 @@ def parse_periodo_from_filename(filename):
 
 def insert_backlog(data_df, resolvido, arquivo_origem, periodo, batch_size=1000, progress_cb=None):
     """Upsert por numero_do_waybill -- reenviar um arquivo, ou um pedido
-    que já apareceu numa carga anterior, nunca duplica: atualiza a linha."""
+    que já apareceu numa carga anterior, nunca duplica: atualiza a linha.
+
+    Alem disso, remove sozinho qualquer linha de HOJE que veio de um
+    arquivo diferente do que está sendo subido agora -- isso evita que um
+    upload de manhã e outro à tarde no mesmo dia se somem (o backlog da
+    tarde deve SUBSTITUIR o da manhã, não empilhar em cima)."""
     slugs = [s for s, _ in resolvido]
     idxs = [i for _, i in resolvido]  # pode conter None se a coluna nao existir no arquivo
     cols_sql = ["arquivo_origem", "periodo_referencia", "row_num"] + slugs
@@ -256,11 +261,20 @@ def insert_backlog(data_df, resolvido, arquivo_origem, periodo, batch_size=1000,
 
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM public.backlog")
-        depois = cur.fetchone()[0]
+        apos_upsert = cur.fetchone()[0]
 
-    novos = depois - antes
+    # Limpeza: remove sobras de um upload ANTERIOR de hoje, de outro arquivo
+    removidos = 0
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM public.backlog WHERE data_snapshot = CURRENT_DATE AND arquivo_origem != %s",
+            (arquivo_origem,),
+        )
+        removidos = cur.rowcount
+
+    novos = apos_upsert - antes
     atualizados = total - novos
-    return total, novos, atualizados
+    return total, novos, atualizados, removidos
 
 
 def registrar_snapshot_historico():
@@ -360,14 +374,20 @@ def render_upload():
                 def _cb(frac):
                     progress.progress(min(frac, 1.0), text=f"Enviando... {frac:.0%}")
 
-                n, novos, atualizados = insert_backlog(data_df, resolvido, uploaded.name, periodo, progress_cb=_cb)
+                n, novos, atualizados, removidos = insert_backlog(data_df, resolvido, uploaded.name, periodo, progress_cb=_cb)
                 registrar_snapshot_historico()
                 progress.empty()
-                st.success(
+                msg = (
                     f"{n} linhas processadas: **{novos} pedidos novos**, "
-                    f"**{atualizados} já existentes** atualizados (nenhum duplicado). "
-                    f"Snapshot de hoje registrado no histórico."
+                    f"**{atualizados} já existentes** atualizados (nenhum duplicado)."
                 )
+                if removidos:
+                    msg += (
+                        f" **{removidos} linha(s) de um upload anterior de hoje (outro arquivo) foram removidas** "
+                        f"-- o backlog de hoje passa a refletir só esse arquivo."
+                    )
+                msg += " Snapshot de hoje registrado no histórico."
+                st.success(msg)
                 st.balloons()
                 st.cache_data.clear()
 
