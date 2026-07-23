@@ -435,7 +435,7 @@ with tab_painel:
         with c4:
             f_status = st.multiselect("Status do Pacote", opcoes_status)
         with c5:
-            f_merchant = st.multiselect("Cliente Merchant / 商户名称", opcoes_merchant)
+            f_merchant = st.multiselect("客户名称(Nome do cliente)", opcoes_cliente)
 
     clauses, params = ["estado_do_ponto_de_entrada = ANY(%(uf_regional)s)"], {"uf_regional": UFS_REGIONAL}
     if f_uf:
