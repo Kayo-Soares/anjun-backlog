@@ -534,11 +534,11 @@ with tab_painel:
                 seta = "▼" if var < 0 else "▲"
                 return f'<span style="color:{cor}; font-weight:800; font-size:1.05rem;">{seta} {abs(var):.1f}%</span> <span style="color:#8A968E; font-size:0.8rem;">vs dia anterior</span>'
 
-            col_t1, col_t2 = st.columns([2, 1])
+            col_t1, col_t2 = st.columns(2)
 
-            # ============ Gráfico principal: Crítico + Extravio ============
+            # ============ Crítico + Extravio (atenção) ============
             with col_t1, st.container(border=True):
-                st.markdown('<div class="chart-title">🚨 CRÍTICO + EXTRAVIO — O QUE IMPORTA ACOMPANHAR</div>', unsafe_allow_html=True)
+                st.markdown('<div class="chart-title">🚨 CRÍTICO + EXTRAVIO — ATENÇÃO</div>', unsafe_allow_html=True)
                 badge_extravio = _delta_badge(hist["extravio"])
                 badge_critico = _delta_badge(hist["critico"])
                 st.markdown(
@@ -553,7 +553,7 @@ with tab_painel:
                     x=eixo_x, y=hist["extravio"], name="Extravio (+20d)",
                     mode="lines+markers+text", line=dict(color=COR_EXTRAVIO, width=4, shape="spline"),
                     marker=dict(size=11, color=COR_EXTRAVIO, line=dict(width=2, color="white")),
-                    text=_rotulos_pontos(hist["extravio"]), textposition="top center",
+                    text=_rotulos_pontos(hist["extravio"]), textposition="top center", cliponaxis=False,
                     textfont=dict(size=13, color=COR_EXTRAVIO, family="Manrope", weight=700),
                     fill="tozeroy", fillcolor="rgba(192,0,0,0.07)",
                     hovertemplate="Extravio: <b>%{y:,}</b><extra></extra>",
@@ -562,7 +562,7 @@ with tab_painel:
                     x=eixo_x, y=hist["critico"], name="Crítico (14-20d)",
                     mode="lines+markers+text", line=dict(color=COR_CRITICO, width=4, shape="spline"),
                     marker=dict(size=11, color=COR_CRITICO, line=dict(width=2, color="white")),
-                    text=_rotulos_pontos(hist["critico"]), textposition="bottom center",
+                    text=_rotulos_pontos(hist["critico"]), textposition="bottom center", cliponaxis=False,
                     textfont=dict(size=13, color=COR_CRITICO, family="Manrope", weight=700),
                     fill="tozeroy", fillcolor="rgba(194,65,12,0.07)",
                     hovertemplate="Crítico: <b>%{y:,}</b><extra></extra>",
@@ -570,35 +570,51 @@ with tab_painel:
                 fig.update_layout(
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(color="#6B7A72"), height=380,
-                    margin=dict(l=10, r=20, t=30, b=10),
+                    margin=dict(l=10, r=40, t=50, b=30),
                     legend=dict(orientation="h", yanchor="bottom", y=1.1, font=dict(size=12)),
                     yaxis_title="Pacotes",
                 )
                 st.plotly_chart(_estilo_eixo(fig), use_container_width=True)
 
-            # ============ Gráfico secundário: Volume Total (contexto) ============
+            # ============ 0-4 dias + 5-13 dias (saudável) ============
             with col_t2, st.container(border=True):
-                st.markdown('<div class="chart-title" style="opacity:0.6;">VOLUME TOTAL (CONTEXTO)</div>', unsafe_allow_html=True)
+                st.markdown('<div class="chart-title">🟢 0-4 E 05-13 DIAS — SAUDÁVEL</div>', unsafe_allow_html=True)
+                badge_d0_4 = _delta_badge(hist["d0_4"], inverso_bom=False)
+                badge_d5_13 = _delta_badge(hist["d5_13"])
                 st.markdown(
-                    f'<div style="margin-bottom:0.6rem;">{_delta_badge(hist["total"], inverso_bom=True)}</div>',
+                    f'<div style="display:flex; gap:2rem; margin-bottom:0.6rem;">'
+                    f'<div><span style="color:{ANJUN_GREEN}; font-weight:700; font-size:0.8rem;">● 0 A 4 DIAS</span><br>{badge_d0_4}</div>'
+                    f'<div><span style="color:#D4A017; font-weight:700; font-size:0.8rem;">● 05 A 13 DIAS</span><br>{badge_d5_13}</div>'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
-                fig2 = go.Figure(go.Scatter(
-                    x=eixo_x, y=hist["total"], mode="lines+markers+text",
-                    line=dict(color="#9AA69E", width=2.5, shape="spline"),
-                    marker=dict(size=7, color="#9AA69E", line=dict(width=1.5, color="white")),
-                    text=_rotulos_pontos(hist["total"]), textposition="top center",
-                    textfont=dict(size=11, color="#6B7A72", family="Manrope"),
-                    fill="tozeroy", fillcolor="rgba(154,166,158,0.10)",
-                    hovertemplate="Total: <b>%{y:,}</b><extra></extra>",
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(
+                    x=eixo_x, y=hist["d0_4"], name="0 a 4 dias",
+                    mode="lines+markers+text", line=dict(color=ANJUN_GREEN, width=4, shape="spline"),
+                    marker=dict(size=11, color=ANJUN_GREEN, line=dict(width=2, color="white")),
+                    text=_rotulos_pontos(hist["d0_4"]), textposition="top center", cliponaxis=False,
+                    textfont=dict(size=13, color=ANJUN_GREEN_DARK, family="Manrope", weight=700),
+                    fill="tozeroy", fillcolor="rgba(0,153,70,0.07)",
+                    hovertemplate="0 a 4 dias: <b>%{y:,}</b><extra></extra>",
+                ))
+                fig2.add_trace(go.Scatter(
+                    x=eixo_x, y=hist["d5_13"], name="05 a 13 dias",
+                    mode="lines+markers+text", line=dict(color="#D4A017", width=4, shape="spline"),
+                    marker=dict(size=11, color="#D4A017", line=dict(width=2, color="white")),
+                    text=_rotulos_pontos(hist["d5_13"]), textposition="bottom center", cliponaxis=False,
+                    textfont=dict(size=13, color="#8A6A0F", family="Manrope", weight=700),
+                    fill="tozeroy", fillcolor="rgba(212,160,23,0.08)",
+                    hovertemplate="05 a 13 dias: <b>%{y:,}</b><extra></extra>",
                 ))
                 fig2.update_layout(
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(color="#6B7A72"), height=380,
-                    margin=dict(l=10, r=10, t=20, b=10), yaxis_title="Pacotes", showlegend=False,
+                    margin=dict(l=10, r=40, t=50, b=30),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.1, font=dict(size=12)),
+                    yaxis_title="Pacotes",
                 )
                 st.plotly_chart(_estilo_eixo(fig2), use_container_width=True)
-                st.caption("Backlog geral, todas as faixas somadas — serve de pano de fundo pro gráfico principal.")
 
         st.divider()
 
