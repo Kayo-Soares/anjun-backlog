@@ -496,23 +496,43 @@ with tab_painel:
 
         # -------------------- Tendência --------------------
         st.markdown('<div class="section-title">📈 Tendência do Backlog / 积压趋势</div>', unsafe_allow_html=True)
-        with st.container(border=True):
-            st.caption("Um ponto por dia de upload. Com só uma carga ainda, vira linha de verdade a partir do próximo envio.")
-            hist = run_query("SELECT * FROM public.backlog_historico_diario ORDER BY data_snapshot")
-            if len(hist) < 2:
+        st.caption("Um ponto por dia (calendário, não por upload) — se subir 2x no mesmo dia, conta como 1 ponto.")
+        hist = run_query("SELECT * FROM public.backlog_historico_diario ORDER BY data_snapshot")
+        if len(hist) < 2:
+            with st.container(border=True):
                 st.info(f"Só há 1 snapshot registrado até agora ({hist.iloc[0]['data_snapshot']:%d/%m}, total {int(hist.iloc[0]['total']):,}). "
                         "A tendência aparece a partir do 2º dia de upload.".replace(",", "."))
-            else:
+        else:
+            def _eixo_data(fig):
+                fig.update_xaxes(type="date", dtick="D1", tickformat="%d/%m", hoverformat="%d/%m/%Y", tickangle=0)
+                return fig
+
+            col_t1, col_t2 = st.columns(2)
+            with col_t1, st.container(border=True):
+                st.markdown('<div class="chart-title">VOLUME TOTAL</div>', unsafe_allow_html=True)
+                fig = go.Figure(go.Scatter(
+                    x=hist["data_snapshot"], y=hist["total"], mode="lines+markers",
+                    line=dict(color=ANJUN_GREEN_DARK, width=3), marker=dict(size=8),
+                    fill="tozeroy", fillcolor="rgba(0,153,70,0.08)",
+                ))
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                                   font=dict(color="#6B7A72"), height=300,
+                                   margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Pacotes")
+                st.plotly_chart(_eixo_data(fig), use_container_width=True)
+                st.caption("Backlog geral, todas as faixas somadas.")
+
+            with col_t2, st.container(border=True):
+                st.markdown('<div class="chart-title">CRÍTICO + EXTRAVIO (O QUE IMPORTA ACOMPANHAR)</div>', unsafe_allow_html=True)
                 fig = go.Figure()
-                for faixa, col, cor in [("0 a 4 dias", "d0_4", ANJUN_GREEN), ("05 a 13 dias", "d5_13", "#D4A017"),
-                                         ("14 a 20 dias (Crítico)", "critico", COR_CRITICO), ("Mais de 20 (Extravio)", "extravio", COR_EXTRAVIO)]:
-                    fig.add_trace(go.Scatter(x=hist["data_snapshot"], y=hist[col], name=faixa, mode="lines+markers",
-                                              stackgroup="one", line=dict(color=cor)))
-                fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#6B7A72"),
-height=320, margin=dict(l=10, r=10, t=10, b=10),
+                fig.add_trace(go.Scatter(x=hist["data_snapshot"], y=hist["critico"], name="Crítico (14-20d)",
+                                          mode="lines+markers", line=dict(color=COR_CRITICO, width=3), marker=dict(size=8)))
+                fig.add_trace(go.Scatter(x=hist["data_snapshot"], y=hist["extravio"], name="Extravio (+20d)",
+                                          mode="lines+markers", line=dict(color=COR_EXTRAVIO, width=3), marker=dict(size=8)))
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                                   font=dict(color="#6B7A72"), height=300, margin=dict(l=10, r=10, t=10, b=10),
                                    legend=dict(orientation="h", yanchor="bottom", y=1.02), yaxis_title="Pacotes")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(_eixo_data(fig), use_container_width=True)
+                st.caption("Escala própria, separada do volume total — pra enxergar se piora/melhora mesmo com poucas centenas de diferença.")
 
         st.divider()
 
