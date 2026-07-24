@@ -503,36 +503,102 @@ with tab_painel:
                 st.info(f"Só há 1 snapshot registrado até agora ({hist.iloc[0]['data_snapshot']:%d/%m}, total {int(hist.iloc[0]['total']):,}). "
                         "A tendência aparece a partir do 2º dia de upload.".replace(",", "."))
         else:
-            def _eixo_data(fig):
-                fig.update_xaxes(type="date", dtick="D1", tickformat="%d/%m", hoverformat="%d/%m/%Y", tickangle=0)
+            eixo_x = list(hist["data_snapshot"])
+            rotulos_x = [d.strftime("%d/%m") for d in eixo_x]
+            mostrar_todos_rotulos = len(hist) <= 8  # evita poluir quando acumular muitos dias
+
+            def _estilo_eixo(fig, altura_extra=0.0):
+                fig.update_xaxes(
+                    type="date", tickmode="array", tickvals=eixo_x, ticktext=rotulos_x,
+                    tickangle=0, hoverformat="%d/%m/%Y", showgrid=False,
+                    tickfont=dict(size=12, family="Manrope"),
+                )
+                fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False)
+                fig.update_layout(hovermode="x unified")
                 return fig
 
-            col_t1, col_t2 = st.columns(2)
-            with col_t1, st.container(border=True):
-                st.markdown('<div class="chart-title">VOLUME TOTAL</div>', unsafe_allow_html=True)
-                fig = go.Figure(go.Scatter(
-                    x=hist["data_snapshot"], y=hist["total"], mode="lines+markers",
-                    line=dict(color=ANJUN_GREEN_DARK, width=3), marker=dict(size=8),
-                    fill="tozeroy", fillcolor="rgba(0,153,70,0.08)",
-                ))
-                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                                   font=dict(color="#6B7A72"), height=300,
-                                   margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Pacotes")
-                st.plotly_chart(_eixo_data(fig), use_container_width=True)
-                st.caption("Backlog geral, todas as faixas somadas.")
+            def _rotulos_pontos(y_vals):
+                """Mostra o valor em todo ponto se tiver poucos dias; senão, só no primeiro e no último."""
+                if mostrar_todos_rotulos:
+                    return [f"{int(v):,}".replace(",", ".") for v in y_vals]
+                return [f"{int(v):,}".replace(",", ".") if i in (0, len(y_vals) - 1) else ""
+                        for i, v in enumerate(y_vals)]
 
-            with col_t2, st.container(border=True):
-                st.markdown('<div class="chart-title">CRÍTICO + EXTRAVIO (O QUE IMPORTA ACOMPANHAR)</div>', unsafe_allow_html=True)
+            def _delta_badge(serie, inverso_bom=True):
+                """▲/▼ + variação % do último ponto vs penúltimo."""
+                if len(serie) < 2 or not serie.iloc[-2]:
+                    return ""
+                var = (serie.iloc[-1] - serie.iloc[-2]) / serie.iloc[-2] * 100
+                melhorou = (var < 0) if inverso_bom else (var > 0)
+                cor = ANJUN_GREEN if melhorou else COR_EXTRAVIO
+                seta = "▼" if var < 0 else "▲"
+                return f'<span style="color:{cor}; font-weight:800; font-size:1.05rem;">{seta} {abs(var):.1f}%</span> <span style="color:#8A968E; font-size:0.8rem;">vs dia anterior</span>'
+
+            col_t1, col_t2 = st.columns([2, 1])
+
+            # ============ Gráfico principal: Crítico + Extravio ============
+            with col_t1, st.container(border=True):
+                st.markdown('<div class="chart-title">🚨 CRÍTICO + EXTRAVIO — O QUE IMPORTA ACOMPANHAR</div>', unsafe_allow_html=True)
+                badge_extravio = _delta_badge(hist["extravio"])
+                badge_critico = _delta_badge(hist["critico"])
+                st.markdown(
+                    f'<div style="display:flex; gap:2rem; margin-bottom:0.6rem;">'
+                    f'<div><span style="color:{COR_EXTRAVIO}; font-weight:700; font-size:0.8rem;">● EXTRAVIO</span><br>{badge_extravio}</div>'
+                    f'<div><span style="color:{COR_CRITICO}; font-weight:700; font-size:0.8rem;">● CRÍTICO</span><br>{badge_critico}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(x=hist["data_snapshot"], y=hist["critico"], name="Crítico (14-20d)",
-                                          mode="lines+markers", line=dict(color=COR_CRITICO, width=3), marker=dict(size=8)))
-                fig.add_trace(go.Scatter(x=hist["data_snapshot"], y=hist["extravio"], name="Extravio (+20d)",
-                                          mode="lines+markers", line=dict(color=COR_EXTRAVIO, width=3), marker=dict(size=8)))
-                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                                   font=dict(color="#6B7A72"), height=300, margin=dict(l=10, r=10, t=10, b=10),
-                                   legend=dict(orientation="h", yanchor="bottom", y=1.02), yaxis_title="Pacotes")
-                st.plotly_chart(_eixo_data(fig), use_container_width=True)
-                st.caption("Escala própria, separada do volume total — pra enxergar se piora/melhora mesmo com poucas centenas de diferença.")
+                fig.add_trace(go.Scatter(
+                    x=eixo_x, y=hist["extravio"], name="Extravio (+20d)",
+                    mode="lines+markers+text", line=dict(color=COR_EXTRAVIO, width=4, shape="spline"),
+                    marker=dict(size=11, color=COR_EXTRAVIO, line=dict(width=2, color="white")),
+                    text=_rotulos_pontos(hist["extravio"]), textposition="top center",
+                    textfont=dict(size=13, color=COR_EXTRAVIO, family="Manrope", weight=700),
+                    fill="tozeroy", fillcolor="rgba(192,0,0,0.07)",
+                    hovertemplate="Extravio: <b>%{y:,}</b><extra></extra>",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=eixo_x, y=hist["critico"], name="Crítico (14-20d)",
+                    mode="lines+markers+text", line=dict(color=COR_CRITICO, width=4, shape="spline"),
+                    marker=dict(size=11, color=COR_CRITICO, line=dict(width=2, color="white")),
+                    text=_rotulos_pontos(hist["critico"]), textposition="bottom center",
+                    textfont=dict(size=13, color=COR_CRITICO, family="Manrope", weight=700),
+                    fill="tozeroy", fillcolor="rgba(194,65,12,0.07)",
+                    hovertemplate="Crítico: <b>%{y:,}</b><extra></extra>",
+                ))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#6B7A72"), height=380,
+                    margin=dict(l=10, r=20, t=30, b=10),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.1, font=dict(size=12)),
+                    yaxis_title="Pacotes",
+                )
+                st.plotly_chart(_estilo_eixo(fig), use_container_width=True)
+
+            # ============ Gráfico secundário: Volume Total (contexto) ============
+            with col_t2, st.container(border=True):
+                st.markdown('<div class="chart-title" style="opacity:0.6;">VOLUME TOTAL (CONTEXTO)</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="margin-bottom:0.6rem;">{_delta_badge(hist["total"], inverso_bom=True)}</div>',
+                    unsafe_allow_html=True,
+                )
+                fig2 = go.Figure(go.Scatter(
+                    x=eixo_x, y=hist["total"], mode="lines+markers+text",
+                    line=dict(color="#9AA69E", width=2.5, shape="spline"),
+                    marker=dict(size=7, color="#9AA69E", line=dict(width=1.5, color="white")),
+                    text=_rotulos_pontos(hist["total"]), textposition="top center",
+                    textfont=dict(size=11, color="#6B7A72", family="Manrope"),
+                    fill="tozeroy", fillcolor="rgba(154,166,158,0.10)",
+                    hovertemplate="Total: <b>%{y:,}</b><extra></extra>",
+                ))
+                fig2.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#6B7A72"), height=380,
+                    margin=dict(l=10, r=10, t=20, b=10), yaxis_title="Pacotes", showlegend=False,
+                )
+                st.plotly_chart(_estilo_eixo(fig2), use_container_width=True)
+                st.caption("Backlog geral, todas as faixas somadas — serve de pano de fundo pro gráfico principal.")
 
         st.divider()
 
