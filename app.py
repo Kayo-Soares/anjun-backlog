@@ -39,6 +39,15 @@ COR_EXTRAVIO = "#C00000"
 # qualquer outro estado que aparecer nos dados é fora do escopo da operação.
 UFS_REGIONAL = ["AM", "AP", "PA", "RR"]
 
+# Motivos que ja saem da responsabilidade operacional ativa (perda confirmada
+# ou pacote que nem e nosso) -- confirmado com o time em 24/07. "Backlog Ativo"
+# exclui esses; "Backlog Total" mostra tudo, sem esse corte.
+MOTIVOS_JA_RESOLVIDOS = [
+    "Perda confirmada - Aguardando indenização",
+    "Perda confirmada-Fake delivery",
+    "Pacote não pertence à Base",
+]
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.path.join(BASE_DIR, "assets", "anjun_logo.png")
 MAPPING_PATH = os.path.join(BASE_DIR, "config", "column_mapping_base.json")
@@ -417,6 +426,17 @@ with tab_painel:
     if ultimo_snapshot is None:
         st.stop()
 
+    # -------------------- Backlog Ativo vs Total --------------------
+    modo_backlog = st.radio(
+        "Visão", ["Backlog Ativo (padrão)", "Backlog Total (inclui perdas confirmadas)"],
+        horizontal=True,
+    )
+    if modo_backlog.startswith("Backlog Ativo"):
+        st.caption(
+            "Exclui pedidos já fechados como perda ou que não pertencem à base "
+            "(confirmado com o time em 24/07): " + "; ".join(MOTIVOS_JA_RESOLVIDOS)
+        )
+
     # -------------------- Filtros --------------------
     opcoes_uf = UFS_REGIONAL
     opcoes_ponto = run_query("SELECT DISTINCT ponto_de_entrada AS v FROM public.backlog_atual WHERE ponto_de_entrada IS NOT NULL ORDER BY 1")["v"].tolist()
@@ -443,6 +463,9 @@ with tab_painel:
             f_cliente = st.multiselect("Nome do Cliente / 客户名称", opcoes_cliente)
 
     clauses, params = ["estado_do_ponto_de_entrada = ANY(%(uf_regional)s)"], {"uf_regional": UFS_REGIONAL}
+    if modo_backlog.startswith("Backlog Ativo"):
+        clauses.append("(motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s))")
+        params["motivos_excluir"] = MOTIVOS_JA_RESOLVIDOS
     if f_uf:
         clauses.append("estado_do_ponto_de_entrada = ANY(%(uf)s)")
         params["uf"] = f_uf
@@ -841,14 +864,20 @@ with tab_dsp:
             )
             st.caption(f"Regional: {', '.join(UFS_REGIONAL)} — apenas os estados que a Anjun responde nessa operação.")
 
+            modo_dsp = st.radio(
+                "Visão", ["Backlog Ativo (padrão)", "Backlog Total (inclui perdas confirmadas)"],
+                horizontal=True, key="modo_dsp",
+            )
+            motivos_excluir_dsp = MOTIVOS_JA_RESOLVIDOS if modo_dsp.startswith("Backlog Ativo") else []
+
             cor_faixa = {
                 "0 a 4 dias": ANJUN_GREEN, "05 a 13 dias": "#D4A017",
                 "14 a 20 dias (Crítico)": COR_CRITICO, "Mais de 20 (Extravio)": COR_EXTRAVIO,
             }
             ordem_faixa = list(cor_faixa.keys())
-            uf_params = {"uf_regional": UFS_REGIONAL}
+            uf_params = {"uf_regional": UFS_REGIONAL, "motivos_excluir": motivos_excluir_dsp}
             total_dsp = run_query(
-                "SELECT count(*) AS n FROM public.backlog_atual WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s)",
+                "SELECT count(*) AS n FROM public.backlog_atual WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s))",
                 uf_params,
             ).iloc[0]["n"]
 
@@ -858,7 +887,7 @@ with tab_dsp:
                 st.markdown('<div class="chart-title">RESPONSÁVEL / 负责人</div>', unsafe_allow_html=True)
                 df = run_query(
                     """SELECT COALESCE(supervisor,'(sem resp.)') AS grupo, count(*) AS n
-                       FROM public.backlog_atual WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s)
+                       FROM public.backlog_atual WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s))
                        GROUP BY grupo ORDER BY n DESC""", uf_params,
                 )
                 fig = go.Figure(go.Bar(x=df["n"], y=df["grupo"], orientation="h", marker_color=COR_EXTRAVIO,
@@ -884,7 +913,7 @@ with tab_dsp:
                 st.markdown('<div class="chart-title">DIAS DE RECEBIMENTO / 收到后几天</div>', unsafe_allow_html=True)
                 df = run_query(
                     """SELECT faixa_recebimento, count(*) AS n FROM public.backlog_atual
-                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND faixa_recebimento IS NOT NULL
+                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s)) AND faixa_recebimento IS NOT NULL
                        GROUP BY faixa_recebimento""", uf_params,
                 )
                 df["ordem"] = df["faixa_recebimento"].apply(lambda x: ordem_faixa.index(x) if x in ordem_faixa else 99)
@@ -903,7 +932,7 @@ with tab_dsp:
                 st.markdown('<div class="chart-title">POR ESTADO / 各州</div>', unsafe_allow_html=True)
                 df = run_query(
                     """SELECT estado_do_ponto_de_entrada AS grupo, count(*) AS n FROM public.backlog_atual
-                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) GROUP BY grupo ORDER BY n DESC""",
+                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s)) GROUP BY grupo ORDER BY n DESC""",
                     uf_params,
                 )
                 fig = go.Figure(go.Bar(x=df["grupo"], y=df["n"], marker_color=COR_EXTRAVIO,
@@ -919,7 +948,7 @@ with tab_dsp:
                 st.markdown('<div class="chart-title">BACKLOG POR DSP / 每个交付点的积压情况</div>', unsafe_allow_html=True)
                 df = run_query(
                     """SELECT ponto_de_entrada AS grupo, count(*) AS n FROM public.backlog_atual
-                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND ponto_de_entrada IS NOT NULL
+                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s)) AND ponto_de_entrada IS NOT NULL
                        GROUP BY grupo ORDER BY n DESC LIMIT 15""", uf_params,
                 )
                 fig = go.Figure(go.Bar(x=df["n"], y=df["grupo"], orientation="h", marker_color=COR_CRITICO,
@@ -934,7 +963,7 @@ with tab_dsp:
                 st.markdown('<div class="chart-title">BACKLOG POR ENTREGADOR / 按派送员</div>', unsafe_allow_html=True)
                 df = run_query(
                     """SELECT entregador AS grupo, count(*) AS n FROM public.backlog_atual
-                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND entregador IS NOT NULL
+                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s)) AND entregador IS NOT NULL
                        GROUP BY grupo ORDER BY n DESC LIMIT 15""", uf_params,
                 )
                 fig = go.Figure(go.Bar(x=df["n"], y=df["grupo"], orientation="h", marker_color=ANJUN_GREEN,
