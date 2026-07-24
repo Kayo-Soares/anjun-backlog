@@ -423,19 +423,24 @@ with tab_painel:
     opcoes_supervisor = run_query("SELECT DISTINCT supervisor AS v FROM public.backlog_atual WHERE supervisor IS NOT NULL ORDER BY 1")["v"].tolist()
     opcoes_status = run_query("SELECT DISTINCT status_do_pacote AS v FROM public.backlog_atual WHERE status_do_pacote IS NOT NULL ORDER BY 1")["v"].tolist()
     opcoes_merchant = run_query("SELECT DISTINCT nome_do_cliente_merchant AS v FROM public.backlog_atual WHERE nome_do_cliente_merchant IS NOT NULL ORDER BY 1")["v"].tolist()
+    opcoes_cliente = run_query("SELECT DISTINCT nome_do_cliente AS v FROM public.backlog_atual WHERE nome_do_cliente IS NOT NULL ORDER BY 1")["v"].tolist()
 
     with st.expander("Filtros / 筛选", expanded=False):
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3 = st.columns(3)
         with c1:
             f_uf = st.multiselect("UF (do ponto de entrada)", opcoes_uf)
         with c2:
             f_ponto = st.multiselect("Ponto de Entrada / DSP", opcoes_ponto)
         with c3:
             f_supervisor = st.multiselect("Supervisor", opcoes_supervisor)
+
+        c4, c5, c6 = st.columns(3)
         with c4:
             f_status = st.multiselect("Status do Pacote", opcoes_status)
         with c5:
-            f_merchant = st.multiselect("客户名称(Nome do cliente)", opcoes_cliente)
+            f_merchant = st.multiselect("Cliente Merchant / 商户名称", opcoes_merchant)
+        with c6:
+            f_cliente = st.multiselect("Nome do Cliente / 客户名称", opcoes_cliente)
 
     clauses, params = ["estado_do_ponto_de_entrada = ANY(%(uf_regional)s)"], {"uf_regional": UFS_REGIONAL}
     if f_uf:
@@ -453,6 +458,9 @@ with tab_painel:
     if f_merchant:
         clauses.append("nome_do_cliente_merchant = ANY(%(merchant)s)")
         params["merchant"] = f_merchant
+    if f_cliente:
+        clauses.append("nome_do_cliente = ANY(%(cliente)s)")
+        params["cliente"] = f_cliente
     where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     and_or_where = " AND " if where_sql else "WHERE "
 
