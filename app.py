@@ -697,16 +697,26 @@ barmode="stack", height=360, margin=dict(l=10, r=10, t=10, b=10),
             )
             df_faixa["ordem"] = df_faixa["faixa_recebimento"].apply(lambda x: ordem_faixa.index(x) if x in ordem_faixa else 99)
             df_faixa = df_faixa.sort_values("ordem")
-            fig = go.Figure(go.Pie(
-                labels=df_faixa["faixa_recebimento"], values=df_faixa["n"], hole=0.55,
-                marker_colors=[cor_faixa.get(f, "#999") for f in df_faixa["faixa_recebimento"]],
-                textinfo="value+percent", texttemplate="%{value:,}<br>(%{percent})",
-                textposition="auto", insidetextorientation="horizontal",
+            # Trocado de pizza pra barra horizontal (30/07): com 4 faixas de
+            # tamanho muito desigual (ex: 65% vs 1,4%), pizza nunca deixa a
+            # fatia pequena legível, nao importa o ajuste de rótulo -- é
+            # limitação estrutural do gráfico, não de estilo. Barra também
+            # preserva a ordem de gravidade (0-4 -> extravio), que pizza não
+            # comunica. Valor + % ficam escritos ao lado de cada barra, onde
+            # sempre há espaço (ao contrário da fatia pequena de uma pizza).
+            pct_faixa = 100 * df_faixa["n"] / df_faixa["n"].sum()
+            rotulos_faixa = [f"{n:,}".replace(",", ".") + f"  ({p:.1f}%)" for n, p in zip(df_faixa["n"], pct_faixa)]
+            fig = go.Figure(go.Bar(
+                x=df_faixa["n"], y=df_faixa["faixa_recebimento"], orientation="h",
+                marker_color=[cor_faixa.get(f, "#999") for f in df_faixa["faixa_recebimento"]],
+                text=rotulos_faixa, textposition="outside", cliponaxis=False,
+                hovertemplate="%{y}<br>%{x:,} pacotes<extra></extra>",
             ))
             fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#6B7A72"),
-height=340, margin=dict(l=30, r=30, t=10, b=10),
-                               legend=dict(orientation="h", yanchor="bottom", y=-0.2, font=dict(size=10)))
+height=280, margin=dict(l=10, r=95, t=10, b=10), showlegend=False,
+                               xaxis=dict(visible=False),
+                               yaxis=dict(autorange="reversed", automargin=True))
             st.plotly_chart(fig, use_container_width=True)
             st.caption("Coluna: `faixa_recebimento` (`tempo_de_inbound_no_ponto` vs hoje)")
 
@@ -941,14 +951,25 @@ with tab_dsp:
                 )
                 df["ordem"] = df["faixa_recebimento"].apply(lambda x: ordem_faixa.index(x) if x in ordem_faixa else 99)
                 df = df.sort_values("ordem")
-                fig = go.Figure(go.Pie(labels=df["faixa_recebimento"], values=df["n"], hole=0.55,
-                                        marker_colors=[cor_faixa.get(f, "#999") for f in df["faixa_recebimento"]],
-                                        textinfo="value+percent", texttemplate="%{value:,}<br>(%{percent})",
-                                        textposition="auto", insidetextorientation="horizontal"))
+                # Trocado de pizza pra barra horizontal (30/07) -- mesmo motivo
+                # do Painel de Backlog: 4 faixas de tamanho muito desigual não
+                # cabem numa fatia de pizza legível, e a ordem de gravidade
+                # (0-4 -> extravio) fica mais clara numa barra do que numa
+                # pizza. Cartão é estreito nessa aba, por isso fonte menor.
+                pct_dsp = 100 * df["n"] / df["n"].sum()
+                rotulos_dsp = [f"{n:,}".replace(",", ".") + f" ({p:.1f}%)" for n, p in zip(df["n"], pct_dsp)]
+                fig = go.Figure(go.Bar(
+                    x=df["n"], y=df["faixa_recebimento"], orientation="h",
+                    marker_color=[cor_faixa.get(f, "#999") for f in df["faixa_recebimento"]],
+                    text=rotulos_dsp, textposition="outside", cliponaxis=False,
+                    textfont=dict(size=10),
+                    hovertemplate="%{y}<br>%{x:,} pacotes<extra></extra>",
+                ))
                 fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="#6B7A72"),
-    height=280, margin=dict(l=30, r=30, t=5, b=5),
-                                   legend=dict(orientation="h", yanchor="bottom", y=-0.3, font=dict(size=9)))
+                    font=dict(color="#6B7A72", size=10),
+    height=280, margin=dict(l=10, r=75, t=5, b=5), showlegend=False,
+                                   xaxis=dict(visible=False),
+                                   yaxis=dict(autorange="reversed", automargin=True))
                 st.plotly_chart(fig, use_container_width=True)
 
             with r1c4, st.container(border=True):
