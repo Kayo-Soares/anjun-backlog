@@ -13,6 +13,16 @@ porque esse arquivo pode vir com colunas extras no meio (ex: "Dia de
 recebimento", "Dias compilados" -- cálculos que o time já faz na mão no
 Excel). Colunas duplicadas (ex: "Centro real de chegada" aparece 3x)
 são casadas na ordem em que aparecem, igual ao modelo original.
+
+--------------------------------------------------------------------
+NOTA (30/07): o filtro "Backlog Ativo" (que exclui pedidos com perda já
+confirmada ou que não pertencem à base) foi migrado para a view SQL
+`backlog_ativo`, em vez de ser reaplicado em Python a cada query com a
+lista MOTIVOS_JA_RESOLVIDOS. Isso evita que outro app/BI que se conecte
+nesse Supabase esqueça de aplicar o mesmo corte -- a regra de negócio
+agora mora num único lugar (o banco). MOTIVOS_JA_RESOLVIDOS continua
+aqui só para exibir a lista pro usuário no st.caption.
+--------------------------------------------------------------------
 """
 
 import json
@@ -42,6 +52,8 @@ UFS_REGIONAL = ["AM", "AP", "PA", "RR"]
 # Motivos que ja saem da responsabilidade operacional ativa (perda confirmada
 # ou pacote que nem e nosso) -- confirmado com o time em 24/07. "Backlog Ativo"
 # exclui esses; "Backlog Total" mostra tudo, sem esse corte.
+# A fonte da verdade desse filtro agora é a view SQL `backlog_ativo`
+# (ver migração create_backlog_ativo_view). Mantido aqui só para exibição.
 MOTIVOS_JA_RESOLVIDOS = [
     "Perda confirmada - Aguardando indenização",
     "Perda confirmada-Fake delivery",
@@ -289,7 +301,12 @@ def insert_backlog(data_df, resolvido, arquivo_origem, periodo, batch_size=1000,
 def registrar_snapshot_historico():
     """Grava (ou atualiza) o resumo agregado do dia na backlog_historico_diario.
     Chamada automaticamente ao fim de cada upload -- é o que dá origem ao
-    gráfico de tendência (backlog crescendo ou caindo ao longo do tempo)."""
+    gráfico de tendência (backlog crescendo ou caindo ao longo do tempo).
+
+    Usa backlog_atual (não backlog_ativo) de propósito: o histórico de
+    tendência deve refletir o volume bruto do dia, igual sempre fez --
+    quem quiser ver a tendência já filtrada por "Backlog Ativo" faz esse
+    corte na hora de ler o histórico, não na hora de gravar."""
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute("""
@@ -431,6 +448,9 @@ with tab_painel:
         "Visão", ["Backlog Ativo (padrão)", "Backlog Total (inclui perdas confirmadas)"],
         horizontal=True,
     )
+    # Fonte da verdade do filtro "Ativo" agora é a view SQL backlog_ativo
+    # (ver migração create_backlog_ativo_view), não mais um WHERE em Python.
+    tabela_fonte = "backlog_ativo" if modo_backlog.startswith("Backlog Ativo") else "backlog_atual"
     if modo_backlog.startswith("Backlog Ativo"):
         st.caption(
             "Exclui pedidos já fechados como perda ou que não pertencem à base "
@@ -438,6 +458,9 @@ with tab_painel:
         )
 
     # -------------------- Filtros --------------------
+    # As opções dos multiselects continuam vindo de backlog_atual (base
+    # completa) de propósito -- mesmo no modo Ativo, o usuário deve poder
+    # ver/filtrar por qualquer valor que já existiu na base.
     opcoes_uf = UFS_REGIONAL
     opcoes_ponto = run_query("SELECT DISTINCT ponto_de_entrada AS v FROM public.backlog_atual WHERE ponto_de_entrada IS NOT NULL ORDER BY 1")["v"].tolist()
     opcoes_supervisor = run_query("SELECT DISTINCT supervisor AS v FROM public.backlog_atual WHERE supervisor IS NOT NULL ORDER BY 1")["v"].tolist()
@@ -463,9 +486,6 @@ with tab_painel:
             f_cliente = st.multiselect("Nome do Cliente / 客户名称", opcoes_cliente)
 
     clauses, params = ["estado_do_ponto_de_entrada = ANY(%(uf_regional)s)"], {"uf_regional": UFS_REGIONAL}
-    if modo_backlog.startswith("Backlog Ativo"):
-        clauses.append("(motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s))")
-        params["motivos_excluir"] = MOTIVOS_JA_RESOLVIDOS
     if f_uf:
         clauses.append("estado_do_ponto_de_entrada = ANY(%(uf)s)")
         params["uf"] = f_uf
@@ -487,7 +507,7 @@ with tab_painel:
     where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     and_or_where = " AND " if where_sql else "WHERE "
 
-    total = run_query(f"SELECT count(*) AS n FROM public.backlog_atual {where_sql}", params).iloc[0]["n"]
+    total = run_query(f"SELECT count(*) AS n FROM public.{tabela_fonte} {where_sql}", params).iloc[0]["n"]
 
     if total == 0:
         st.warning("Nenhum pacote encontrado com esse filtro.")
@@ -502,7 +522,7 @@ with tab_painel:
             f"""SELECT count(*) AS total, avg(dias_sem_movimentacao) AS media_mov,
                        avg(dias_desde_recebimento) AS media_receb,
                        count(*) FILTER (WHERE faixa_recebimento IN ('14 a 20 dias (Crítico)','Mais de 20 (Extravio)')) AS n_atencao
-                FROM public.backlog_atual {where_sql}""",
+                FROM public.{tabela_fonte} {where_sql}""",
             params,
         ).iloc[0]
 
@@ -645,7 +665,7 @@ with tab_painel:
         st.markdown('<div class="section-title">👤 Backlog por Responsável, detalhado por faixa / 按负责人及天数分布</div>', unsafe_allow_html=True)
         df_sf = run_query(
             f"""SELECT COALESCE(supervisor, '(sem responsável)') AS supervisor, faixa_recebimento, count(*) AS n
-                FROM public.backlog_atual {where_sql} {and_or_where} faixa_recebimento IS NOT NULL
+                FROM public.{tabela_fonte} {where_sql} {and_or_where} faixa_recebimento IS NOT NULL
                 GROUP BY supervisor, faixa_recebimento""",
             params,
         )
@@ -671,7 +691,7 @@ barmode="stack", height=360, margin=dict(l=10, r=10, t=10, b=10),
         with colA, st.container(border=True):
             st.markdown('<div class="chart-title">DIAS DESDE O RECEBIMENTO</div>', unsafe_allow_html=True)
             df_faixa = run_query(
-                f"""SELECT faixa_recebimento, count(*) AS n FROM public.backlog_atual {where_sql}
+                f"""SELECT faixa_recebimento, count(*) AS n FROM public.{tabela_fonte} {where_sql}
                     {and_or_where} faixa_recebimento IS NOT NULL GROUP BY faixa_recebimento""",
                 params,
             )
@@ -700,7 +720,7 @@ height=340, margin=dict(l=30, r=30, t=10, b=10),
                            WHEN dias_sem_movimentacao <= 10 THEN '6 a 10 dias'
                            ELSE 'Mais de 10 dias' END AS faixa_mov,
                       count(*) AS n
-                    FROM public.backlog_atual {where_sql}
+                    FROM public.{tabela_fonte} {where_sql}
                     {and_or_where} dias_sem_movimentacao IS NOT NULL GROUP BY faixa_mov""",
                 params,
             )
@@ -727,7 +747,7 @@ height=320, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Pacotes")
         with colC, st.container(border=True):
             st.markdown('<div class="chart-title">POR ESTADO</div>', unsafe_allow_html=True)
             df_uf = run_query(
-                f"""SELECT estado_do_ponto_de_entrada AS grupo, count(*) AS n FROM public.backlog_atual {where_sql}
+                f"""SELECT estado_do_ponto_de_entrada AS grupo, count(*) AS n FROM public.{tabela_fonte} {where_sql}
                     {and_or_where} estado_do_ponto_de_entrada IS NOT NULL GROUP BY grupo ORDER BY n DESC""",
                 params,
             )
@@ -742,7 +762,7 @@ height=340, margin=dict(l=10, r=10, t=10, b=10))
         with colD, st.container(border=True):
             st.markdown('<div class="chart-title">POR PONTO DE ENTRADA / DSP (TOP 15)</div>', unsafe_allow_html=True)
             df_dsp = run_query(
-                f"""SELECT ponto_de_entrada AS grupo, count(*) AS n FROM public.backlog_atual {where_sql}
+                f"""SELECT ponto_de_entrada AS grupo, count(*) AS n FROM public.{tabela_fonte} {where_sql}
                     {and_or_where} ponto_de_entrada IS NOT NULL GROUP BY grupo ORDER BY n DESC LIMIT 15""",
                 params,
             )
@@ -764,7 +784,7 @@ height=340, margin=dict(l=10, r=65, t=10, b=10))
             st.markdown('<div class="chart-title">POR CLIENTE MERCHANT (TOP 15)</div>', unsafe_allow_html=True)
             st.caption("No painel de referência isso estava rotulado \"Status do Pacote\" -- os valores eram nomes de empresa, corrigido aqui.")
             df_merchant = run_query(
-                f"""SELECT nome_do_cliente_merchant AS grupo, count(*) AS n FROM public.backlog_atual {where_sql}
+                f"""SELECT nome_do_cliente_merchant AS grupo, count(*) AS n FROM public.{tabela_fonte} {where_sql}
                     {and_or_where} nome_do_cliente_merchant IS NOT NULL GROUP BY grupo ORDER BY n DESC LIMIT 15""",
                 params,
             )
@@ -781,7 +801,7 @@ height=380, margin=dict(l=10, r=65, t=10, b=10))
             st.markdown('<div class="chart-title">MOTIVO DA OCORRÊNCIA — SÓ CRÍTICO + EXTRAVIO</div>', unsafe_allow_html=True)
             st.caption("Coluna nova nessa análise: hoje não era usada. Mostra só os pacotes em atenção (14+ dias), pra separar 'perda confirmada' (financeiro) de 'endereço errado' (operacional).")
             df_motivo = run_query(
-                f"""SELECT motivo_da_ocorrencia AS grupo, count(*) AS n FROM public.backlog_atual {where_sql}
+                f"""SELECT motivo_da_ocorrencia AS grupo, count(*) AS n FROM public.{tabela_fonte} {where_sql}
                     {and_or_where} faixa_recebimento IN ('14 a 20 dias (Crítico)','Mais de 20 (Extravio)')
                     AND motivo_da_ocorrencia IS NOT NULL
                     GROUP BY grupo ORDER BY n DESC LIMIT 10""",
@@ -804,7 +824,7 @@ height=380, margin=dict(l=10, r=65, t=10, b=10))
         # -------------------- Status --------------------
         st.markdown('<div class="section-title">📦 Status do Pacote / 运单状态</div>', unsafe_allow_html=True)
         df_status = run_query(
-            f"""SELECT status_do_pacote AS grupo, count(*) AS n FROM public.backlog_atual {where_sql}
+            f"""SELECT status_do_pacote AS grupo, count(*) AS n FROM public.{tabela_fonte} {where_sql}
                 {and_or_where} status_do_pacote IS NOT NULL GROUP BY grupo ORDER BY n DESC""",
             params,
         )
@@ -830,7 +850,7 @@ height=280, margin=dict(l=10, r=65, t=10, b=10))
                        dias_sem_movimentacao AS "Dias sem mov.",
                        dias_desde_recebimento AS "Dias desde receb.",
                        faixa_recebimento AS "Faixa"
-                FROM public.backlog_atual {where_sql}
+                FROM public.{tabela_fonte} {where_sql}
                 ORDER BY dias_desde_recebimento DESC NULLS LAST LIMIT 200""",
             params,
         )
@@ -868,16 +888,19 @@ with tab_dsp:
                 "Visão", ["Backlog Ativo (padrão)", "Backlog Total (inclui perdas confirmadas)"],
                 horizontal=True, key="modo_dsp",
             )
-            motivos_excluir_dsp = MOTIVOS_JA_RESOLVIDOS if modo_dsp.startswith("Backlog Ativo") else []
+            # Idem ao Painel: a fonte da verdade do filtro "Ativo" é a view
+            # SQL backlog_ativo, não mais um AND motivo_da_ocorrencia != ALL(...)
+            # reaplicado em cada query desta aba.
+            tabela_dsp = "backlog_ativo" if modo_dsp.startswith("Backlog Ativo") else "backlog_atual"
 
             cor_faixa = {
                 "0 a 4 dias": ANJUN_GREEN, "05 a 13 dias": "#D4A017",
                 "14 a 20 dias (Crítico)": COR_CRITICO, "Mais de 20 (Extravio)": COR_EXTRAVIO,
             }
             ordem_faixa = list(cor_faixa.keys())
-            uf_params = {"uf_regional": UFS_REGIONAL, "motivos_excluir": motivos_excluir_dsp}
+            uf_params = {"uf_regional": UFS_REGIONAL}
             total_dsp = run_query(
-                "SELECT count(*) AS n FROM public.backlog_atual WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s))",
+                f"SELECT count(*) AS n FROM public.{tabela_dsp} WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s)",
                 uf_params,
             ).iloc[0]["n"]
 
@@ -886,8 +909,8 @@ with tab_dsp:
             with r1c1, st.container(border=True):
                 st.markdown('<div class="chart-title">RESPONSÁVEL / 负责人</div>', unsafe_allow_html=True)
                 df = run_query(
-                    """SELECT COALESCE(supervisor,'(sem resp.)') AS grupo, count(*) AS n
-                       FROM public.backlog_atual WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s))
+                    f"""SELECT COALESCE(supervisor,'(sem resp.)') AS grupo, count(*) AS n
+                       FROM public.{tabela_dsp} WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s)
                        GROUP BY grupo ORDER BY n DESC""", uf_params,
                 )
                 fig = go.Figure(go.Bar(x=df["n"], y=df["grupo"], orientation="h", marker_color=COR_EXTRAVIO,
@@ -912,8 +935,8 @@ with tab_dsp:
             with r1c3, st.container(border=True):
                 st.markdown('<div class="chart-title">DIAS DE RECEBIMENTO / 收到后几天</div>', unsafe_allow_html=True)
                 df = run_query(
-                    """SELECT faixa_recebimento, count(*) AS n FROM public.backlog_atual
-                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s)) AND faixa_recebimento IS NOT NULL
+                    f"""SELECT faixa_recebimento, count(*) AS n FROM public.{tabela_dsp}
+                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND faixa_recebimento IS NOT NULL
                        GROUP BY faixa_recebimento""", uf_params,
                 )
                 df["ordem"] = df["faixa_recebimento"].apply(lambda x: ordem_faixa.index(x) if x in ordem_faixa else 99)
@@ -931,8 +954,8 @@ with tab_dsp:
             with r1c4, st.container(border=True):
                 st.markdown('<div class="chart-title">POR ESTADO / 各州</div>', unsafe_allow_html=True)
                 df = run_query(
-                    """SELECT estado_do_ponto_de_entrada AS grupo, count(*) AS n FROM public.backlog_atual
-                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s)) GROUP BY grupo ORDER BY n DESC""",
+                    f"""SELECT estado_do_ponto_de_entrada AS grupo, count(*) AS n FROM public.{tabela_dsp}
+                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) GROUP BY grupo ORDER BY n DESC""",
                     uf_params,
                 )
                 fig = go.Figure(go.Bar(x=df["grupo"], y=df["n"], marker_color=COR_EXTRAVIO,
@@ -947,8 +970,8 @@ with tab_dsp:
             with r2c1, st.container(border=True):
                 st.markdown('<div class="chart-title">BACKLOG POR DSP / 每个交付点的积压情况</div>', unsafe_allow_html=True)
                 df = run_query(
-                    """SELECT ponto_de_entrada AS grupo, count(*) AS n FROM public.backlog_atual
-                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s)) AND ponto_de_entrada IS NOT NULL
+                    f"""SELECT ponto_de_entrada AS grupo, count(*) AS n FROM public.{tabela_dsp}
+                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND ponto_de_entrada IS NOT NULL
                        GROUP BY grupo ORDER BY n DESC LIMIT 15""", uf_params,
                 )
                 fig = go.Figure(go.Bar(x=df["n"], y=df["grupo"], orientation="h", marker_color=COR_CRITICO,
@@ -962,8 +985,8 @@ with tab_dsp:
             with r2c2, st.container(border=True):
                 st.markdown('<div class="chart-title">BACKLOG POR ENTREGADOR / 按派送员</div>', unsafe_allow_html=True)
                 df = run_query(
-                    """SELECT entregador AS grupo, count(*) AS n FROM public.backlog_atual
-                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND (motivo_da_ocorrencia IS NULL OR motivo_da_ocorrencia != ALL(%(motivos_excluir)s)) AND entregador IS NOT NULL
+                    f"""SELECT entregador AS grupo, count(*) AS n FROM public.{tabela_dsp}
+                       WHERE estado_do_ponto_de_entrada = ANY(%(uf_regional)s) AND entregador IS NOT NULL
                        GROUP BY grupo ORDER BY n DESC LIMIT 15""", uf_params,
                 )
                 fig = go.Figure(go.Bar(x=df["n"], y=df["grupo"], orientation="h", marker_color=ANJUN_GREEN,
