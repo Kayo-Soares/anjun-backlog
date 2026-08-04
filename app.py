@@ -362,52 +362,46 @@ def _formatar_motivo(motivo):
 
 def _df_hub(supervisor_filtro=None):
     """
-    Busca pedidos que estão no ponto_de_entrada mas SEM ponto_de_entrega —
-    ou seja, chegaram no DSP mas ainda não foram expedidos para um entregador.
-    Inclui três situações:
-      - 'Recebido no ponto de entrega': chegou, parado no hub
-      - 'Em rota de entrega': saiu para rota mas sem entregador registrado
-      - 'Pedido com anomalia': falhou sem entregador nominado
+    Busca pedidos no ponto_de_entrada sem ponto_de_entrega.
+    Query construída como string pura (sem f-string e sem params psycopg2)
+    para evitar conflito entre as aspas literais do SQL (YYYY-MM-DD)
+    e o parser de placeholders do psycopg2.
     """
-    params = None
-    filtro_supervisor = ""
     if supervisor_filtro:
-        params = {"supervisores": supervisor_filtro}
-        filtro_supervisor = "AND s.supervisor = ANY(%(supervisores)s)"
+        lista = ", ".join("'" + s.replace("'", "''") + "'" for s in supervisor_filtro)
+        filtro_sup = "AND s.supervisor IN (" + lista + ")"
+    else:
+        filtro_sup = ""
 
-    sql = f"""
-        SELECT
-            b.ponto_de_entrada                          AS "Ponto (IATA)",
-            s.supervisor                                AS "Supervisor",
-            b.status_do_pacote                          AS "Status",
-            b.numero_do_waybill                         AS "Waybill",
-            b.cidade_do_destinatario                    AS "Cidade",
-            b.estado_do_destinatario                    AS "UF",
-            b.horario_em_que_deve_ser_entregue          AS "Prazo",
-            b.ultimo_data_de_rastreio                   AS "Último rastreio",
-            b.ultimo_rastreio                           AS "Último status",
-            b.motivo_da_ocorrencia                      AS "Motivo (raw)",
-            (CURRENT_DATE - TO_DATE(
-                LEFT(b.horario_em_que_deve_ser_entregue, 10), 'YYYY-MM-DD'
-            ))                                          AS "Dias atraso",
-            CASE
-                WHEN b.tempo_de_inbound_no_ponto IS NOT NULL
-                     AND b.tempo_de_inbound_no_ponto NOT LIKE '--%'
-                THEN (CURRENT_DATE - TO_DATE(
-                        LEFT(b.tempo_de_inbound_no_ponto, 10), 'YYYY-MM-DD'
-                     ))
-                ELSE NULL
-            END                                         AS "Dias no hub"
-        FROM public.backlog b
-        LEFT JOIN public.supervisores s
-            ON s.ponto = b.ponto_de_entrada
-        WHERE b.data_snapshot = (SELECT MAX(data_snapshot) FROM public.backlog)
-          AND b.ponto_de_entrega IS NULL
-          AND b.ponto_de_entrada IS NOT NULL
-          {filtro_supervisor}
-        ORDER BY b.ponto_de_entrada, "Dias atraso" DESC NULLS LAST
-    """
-    return run_query(sql, params)
+    sql = (
+        "SELECT"
+        "  b.ponto_de_entrada                        AS \"Ponto (IATA)\","
+        "  s.supervisor                              AS \"Supervisor\","
+        "  b.status_do_pacote                        AS \"Status\","
+        "  b.numero_do_waybill                       AS \"Waybill\","
+        "  b.cidade_do_destinatario                  AS \"Cidade\","
+        "  b.estado_do_destinatario                  AS \"UF\","
+        "  b.horario_em_que_deve_ser_entregue        AS \"Prazo\","
+        "  b.ultimo_data_de_rastreio                 AS \"Último rastreio\","
+        "  b.ultimo_rastreio                         AS \"Último status\","
+        "  b.motivo_da_ocorrencia                    AS \"Motivo (raw)\","
+        "  (CURRENT_DATE - TO_DATE("
+        "      LEFT(b.horario_em_que_deve_ser_entregue, 10), 'YYYY-MM-DD'"
+        "  ))                                        AS \"Dias atraso\""
+        "  FROM public.backlog b"
+        "  LEFT JOIN public.supervisores s ON s.ponto = b.ponto_de_entrada"
+        "  WHERE b.data_snapshot = (SELECT MAX(data_snapshot) FROM public.backlog)"
+        "    AND b.ponto_de_entrega IS NULL"
+        "    AND b.ponto_de_entrada IS NOT NULL"
+        "    " + filtro_sup +
+        "  ORDER BY b.ponto_de_entrada, \"Dias atraso\" DESC NULLS LAST"
+    )
+    conn = get_connection()
+    try:
+        return pd.read_sql(sql, conn)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _df_cobranca(supervisor_filtro=None):
