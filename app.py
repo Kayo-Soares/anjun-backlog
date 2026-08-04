@@ -357,6 +357,56 @@ def _formatar_motivo(motivo):
     return MOTIVOS_ALERTA.get(str(motivo).strip(), str(motivo))
 
 
+def _df_hub(supervisor_filtro=None):
+    """
+    Busca pedidos que estão no ponto_de_entrada mas SEM ponto_de_entrega —
+    ou seja, chegaram no DSP mas ainda não foram expedidos para um entregador.
+    Inclui três situações:
+      - 'Recebido no ponto de entrega': chegou, parado no hub
+      - 'Em rota de entrega': saiu para rota mas sem entregador registrado
+      - 'Pedido com anomalia': falhou sem entregador nominado
+    """
+    params = {}
+    filtro_supervisor = ""
+    if supervisor_filtro:
+        filtro_supervisor = "AND s.supervisor = ANY(%(supervisores)s)"
+        params["supervisores"] = supervisor_filtro
+
+    sql = f"""
+        SELECT
+            b.ponto_de_entrada                          AS "Ponto (IATA)",
+            s.supervisor                                AS "Supervisor",
+            b.status_do_pacote                          AS "Status",
+            b.numero_do_waybill                         AS "Waybill",
+            b.cidade_do_destinatario                    AS "Cidade",
+            b.estado_do_destinatario                    AS "UF",
+            b.horario_em_que_deve_ser_entregue          AS "Prazo",
+            b.ultimo_data_de_rastreio                   AS "Último rastreio",
+            b.ultimo_rastreio                           AS "Último status",
+            b.motivo_da_ocorrencia                      AS "Motivo (raw)",
+            (CURRENT_DATE - TO_DATE(
+                LEFT(b.horario_em_que_deve_ser_entregue, 10), 'YYYY-MM-DD'
+            ))                                          AS "Dias atraso",
+            CASE
+                WHEN b.tempo_de_inbound_no_ponto IS NOT NULL
+                     AND b.tempo_de_inbound_no_ponto NOT LIKE '--%'
+                THEN (CURRENT_DATE - TO_DATE(
+                        LEFT(b.tempo_de_inbound_no_ponto, 10), 'YYYY-MM-DD'
+                     ))
+                ELSE NULL
+            END                                         AS "Dias no hub"
+        FROM public.backlog b
+        LEFT JOIN public.supervisores s
+            ON s.ponto = b.ponto_de_entrada
+        WHERE b.data_snapshot = (SELECT MAX(data_snapshot) FROM public.backlog)
+          AND b.ponto_de_entrega IS NULL
+          AND b.ponto_de_entrada IS NOT NULL
+          {filtro_supervisor}
+        ORDER BY b.ponto_de_entrada, "Dias atraso" DESC NULLS LAST
+    """
+    return run_query(sql, params)
+
+
 def _df_cobranca(supervisor_filtro=None):
     """
     Busca no banco todos os pedidos em backlog do snapshot mais recente,
@@ -1055,14 +1105,13 @@ with tab_dsp:
 
 # ===================== ABA COBRANÇA IATA =====================
 with tab_cobranca:
-    st.subheader("📋 Cobrança IATA — Lista de Waybills por Entregador")
+    st.subheader("📋 Cobrança IATA — Visão completa do backlog por ponto")
     st.caption(
-        "Lista operacional para cobrança diária dos DSPs. Mostra todos os pedidos em backlog "
-        "com ponto de entrega mapeado, agrupados por ponto e entregador, ordenados pelo maior atraso. "
-        "Filtre por supervisor para ver só a sua carteira."
+        "Três situações: pedidos com entregador nominado, pedidos parados no hub (sem expedição) "
+        "e pedidos em rota sem responsável registrado. Filtre por supervisor para ver só a sua carteira."
     )
 
-    # ── Filtros da aba Cobrança ──────────────────────────────────────
+    # ── Filtros globais (compartilhados pelas 3 sub-abas) ────────────
     opcoes_sup_cob = run_query(
         "SELECT DISTINCT supervisor FROM public.supervisores WHERE supervisor IS NOT NULL ORDER BY 1"
     )["supervisor"].tolist()
@@ -1085,9 +1134,10 @@ with tab_cobranca:
         )
     with col_f3:
         apenas_anomalia = st.checkbox(
-            "Só 'Pedido com anomalia'",
+            "Só anomalia",
             value=False,
             key="cob_anomalia",
+            help="Filtra só status 'Pedido com anomalia'.",
         )
     with col_f4:
         prazo_resposta = st.text_input(
@@ -1097,205 +1147,353 @@ with tab_cobranca:
             help="Aparece no rodapé da mensagem de WhatsApp.",
         )
 
-    # ── Carrega dados ────────────────────────────────────────────────
-    df_cob = _df_cobranca(f_sup_cob if f_sup_cob else None)
+    # ── Carrega os dois conjuntos de dados ───────────────────────────
+    sup_filtro = f_sup_cob if f_sup_cob else None
+    df_cob  = _df_cobranca(sup_filtro)   # com entregador nominado
+    df_hub  = _df_hub(sup_filtro)        # sem entregador (hub)
 
-    if df_cob.empty:
-        st.warning("Nenhum pedido encontrado com ponto de entrega mapeado no snapshot mais recente.")
-        st.stop()
-
-    # Converte tipos
-    df_cob["Dias atraso"] = pd.to_numeric(df_cob["Dias atraso"], errors="coerce")
-
-    # Aplica filtros adicionais
+    # Converte e aplica filtros comuns
+    for df in [df_cob, df_hub]:
+        df["Dias atraso"] = pd.to_numeric(df["Dias atraso"], errors="coerce")
     if f_min_dias > 0:
         df_cob = df_cob[df_cob["Dias atraso"].fillna(0) >= f_min_dias]
+        df_hub = df_hub[df_hub["Dias atraso"].fillna(0) >= f_min_dias]
     if apenas_anomalia:
         df_cob = df_cob[df_cob["Status do pacote"].str.contains("anomalia", case=False, na=False)]
+        df_hub = df_hub[df_hub["Status"].str.contains("anomalia", case=False, na=False)]
 
-    if df_cob.empty:
-        st.warning("Nenhum pedido com esses filtros.")
-        st.stop()
-
-    # Adiciona coluna de urgência (texto, para exibição)
-    df_cob["Urgência"] = df_cob["Dias atraso"].apply(lambda d: _urgencia_label(d)[0])
-
-    # Formata motivo com prefixo de alerta
+    # Formata colunas extras no df_cob
+    df_cob["Urgência"]           = df_cob["Dias atraso"].apply(lambda d: _urgencia_label(d)[0])
     df_cob["Motivo da ocorrência"] = df_cob["Motivo (raw)"].apply(_formatar_motivo)
+    df_hub["Urgência"]           = df_hub["Dias atraso"].apply(lambda d: _urgencia_label(d)[0])
+    df_hub["Motivo da ocorrência"] = df_hub["Motivo (raw)"].apply(_formatar_motivo)
 
-    # ── KPIs rápidos ─────────────────────────────────────────────────
-    total_cob = len(df_cob)
-    criticos_cob = len(df_cob[df_cob["Dias atraso"].fillna(0) >= 30])
-    pontos_cob = df_cob["Ponto (IATA)"].nunique()
-    entregadores_cob = df_cob["Entregador"].nunique()
-    alertas_cob = df_cob["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys()).sum()
+    # Separa o hub em sub-grupos por status
+    df_hub_parado  = df_hub[df_hub["Status"] == "Recebido no ponto de entrega"]
+    df_hub_rota    = df_hub[df_hub["Status"] == "Em rota de entrega"]
+    df_hub_anomalia = df_hub[df_hub["Status"] == "Pedido com anomalia"]
+
+    # ── KPIs consolidados (topo, antes das sub-abas) ─────────────────
+    total_nominado  = len(df_cob)
+    total_parado    = len(df_hub_parado)
+    total_rota_sr   = len(df_hub_rota)
+    total_anomalia_sr = len(df_hub_anomalia)
+    total_geral     = total_nominado + len(df_hub)
+    alertas_cob     = df_cob["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys()).sum()
+    alertas_hub     = df_hub["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys()).sum()
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total de pedidos", total_cob)
-    k2.metric("Críticos (30+ dias)", criticos_cob,
-              delta=f"{100*criticos_cob/total_cob:.0f}% do total" if total_cob else "0%",
-              delta_color="inverse")
-    k3.metric("Pontos (IATAs)", pontos_cob)
-    k4.metric("Entregadores distintos", entregadores_cob)
-    k5.metric("🚨 Roubos / Perdas / Risco", alertas_cob,
-              delta="requer ação imediata" if alertas_cob > 0 else "nenhum",
-              delta_color="inverse" if alertas_cob > 0 else "normal")
+    k1.metric("Total geral", total_geral)
+    k2.metric("👤 Com entregador", total_nominado,
+              help="Expedidos para um entregador específico")
+    k3.metric("📦 Parados no hub", total_parado,
+              help="Recebidos no ponto mas não expedidos")
+    k4.metric("🔄 Em rota s/ responsável", total_rota_sr,
+              help="Saíram para rota mas sem entregador registrado")
+    k5.metric("🚨 Motivos críticos", alertas_cob + alertas_hub,
+              delta="requer ação imediata" if (alertas_cob + alertas_hub) > 0 else "nenhum",
+              delta_color="inverse" if (alertas_cob + alertas_hub) > 0 else "normal")
 
     st.divider()
 
-    # ── Resumo por ponto ─────────────────────────────────────────────
-    st.markdown('<div class="section-title">📍 Resumo por Ponto (IATA)</div>', unsafe_allow_html=True)
+    # ── Sub-abas por situação ────────────────────────────────────────
+    sub_nominado, sub_parado, sub_rota, sub_anomalia_sr = st.tabs([
+        f"👤 Com entregador ({total_nominado})",
+        f"📦 Parados no hub ({total_parado})",
+        f"🔄 Em rota s/ responsável ({total_rota_sr})",
+        f"⚠️ Anomalia s/ responsável ({total_anomalia_sr})",
+    ])
 
-    resumo_ponto = (
-        df_cob.groupby("Ponto (IATA)")
-        .agg(
-            Supervisor=("Supervisor", "first"),
-            Total=("Waybill", "count"),
-            Criticos=("Dias atraso", lambda x: (x.fillna(0) >= 30).sum()),
-            Mais_antigo=("Dias atraso", lambda x: x.max()),
-        )
-        .reset_index()
-        .sort_values("Total", ascending=False)
-        .rename(columns={"Criticos": "Críticos (30+d)", "Mais_antigo": "Mais antigo (dias)"})
-    )
-    st.dataframe(resumo_ponto, use_container_width=True, hide_index=True)
+    # ── helper: renderiza tabela expandida por ponto ─────────────────
+    def _render_por_ponto(df, col_ponto, col_entregador=None, prefixo_key=""):
+        """
+        Renderiza expanders por ponto com tabela, aviso de alertas e CSV.
+        col_entregador=None quando não há entregador nominado.
+        """
+        if df.empty:
+            st.info("Nenhum pedido nessa situação com os filtros aplicados.")
+            return
 
-    st.divider()
+        pontos = sorted(df[col_ponto].dropna().unique())
+        for ponto in pontos:
+            df_p = df[df[col_ponto] == ponto].copy()
+            sup_p = df_p["Supervisor"].dropna().iloc[0] if not df_p["Supervisor"].dropna().empty else "—"
+            total_p = len(df_p)
+            critico_p = len(df_p[df_p["Dias atraso"].fillna(0) >= 14])
+            mais_antigo_p = int(df_p["Dias atraso"].max()) if not df_p["Dias atraso"].isna().all() else "—"
+            emoji_p = "🔴" if critico_p == total_p else "🟠" if critico_p > total_p * 0.5 else "🟡"
 
-    # ── Lista completa agrupada por ponto → entregador ───────────────
-    st.markdown('<div class="section-title">🎯 Waybills por Entregador (para cobrança)</div>', unsafe_allow_html=True)
-    st.caption("Expandido por ponto. Clique no cabeçalho da coluna para reordenar.")
+            with st.expander(
+                f"{emoji_p} **{ponto}** — {total_p} pedido(s) · {critico_p} crítico(s) · mais antigo: {mais_antigo_p}d · Sup: {sup_p}",
+                expanded=(total_p >= 3),
+            ):
+                alertas_p = df_p["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys()).sum()
+                if alertas_p > 0:
+                    resumo_alert = ", ".join(
+                        f"{m} ({n}x)" for m, n in
+                        df_p[df_p["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys())]["Motivo da ocorrência"].value_counts().items()
+                    )
+                    st.warning(f"🚨 **{alertas_p} pedido(s) com motivo crítico:** {resumo_alert}")
 
-    pontos_disponiveis = sorted(df_cob["Ponto (IATA)"].dropna().unique())
+                cols_base = ["Waybill", "Urgência", "Dias atraso", "Dias no hub", "Motivo da ocorrência",
+                             "Prazo", "Último rastreio", "Cidade", "UF", "Status" if col_entregador is None else "Status do pacote"]
+                if col_entregador:
+                    cols_base = [col_entregador] + cols_base
+                cols_show = [c for c in cols_base if c in df_p.columns]
 
-    for ponto in pontos_disponiveis:
-        df_ponto = df_cob[df_cob["Ponto (IATA)"] == ponto].copy()
-        supervisor_ponto = df_ponto["Supervisor"].dropna().iloc[0] if not df_ponto["Supervisor"].dropna().empty else "—"
-        total_ponto = len(df_ponto)
-        critico_ponto = len(df_ponto[df_ponto["Dias atraso"].fillna(0) >= 14])
-        mais_antigo = int(df_ponto["Dias atraso"].max()) if not df_ponto["Dias atraso"].isna().all() else "—"
-
-        label_critico = f"🔴" if critico_ponto == total_ponto else f"🟠" if critico_ponto > total_ponto * 0.5 else "🟡"
-
-        with st.expander(
-            f"{label_critico} **{ponto}** — {total_ponto} pedido(s) · {critico_ponto} crítico(s) · mais antigo: {mais_antigo}d · Supervisor: {supervisor_ponto}",
-            expanded=(total_ponto >= 3),
-        ):
-            # Colunas relevantes para cobrança
-            colunas_exibir = [
-                "Entregador", "Waybill", "Urgência",
-                "Dias atraso", "Motivo da ocorrência", "Prazo",
-                "Último rastreio", "Cidade", "UF", "Status do pacote",
-            ]
-            df_show = df_ponto[colunas_exibir].sort_values("Dias atraso", ascending=False, na_position="last")
-
-            # Aviso se houver casos críticos de motivo dentro do ponto
-            alertas_ponto = df_ponto["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys()).sum()
-            if alertas_ponto > 0:
-                motivos_encontrados = (
-                    df_ponto[df_ponto["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys())]
-                    ["Motivo da ocorrência"].value_counts()
+                df_show = df_p[cols_show].sort_values("Dias atraso", ascending=False, na_position="last")
+                st.dataframe(
+                    df_show,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Waybill": st.column_config.TextColumn("Waybill", width="medium"),
+                        "Urgência": st.column_config.TextColumn("Urgência", width="medium"),
+                        "Motivo da ocorrência": st.column_config.TextColumn("Motivo da ocorrência", width="large"),
+                        "Dias atraso": st.column_config.NumberColumn("Dias atraso", format="%d"),
+                        "Dias no hub": st.column_config.NumberColumn("Dias no hub", format="%d",
+                            help="Dias desde que o pacote chegou no ponto (inbound). Mede represamento no DSP."),
+                        "Prazo": st.column_config.DatetimeColumn("Prazo", format="DD/MM/YYYY"),
+                        "Último rastreio": st.column_config.DatetimeColumn("Último rastreio", format="DD/MM HH:mm"),
+                    },
                 )
-                resumo = ", ".join(f"{m} ({n}x)" for m, n in motivos_encontrados.items())
-                st.warning(f"🚨 **{alertas_ponto} pedido(s) com motivo crítico:** {resumo}")
+                csv_p = df_show.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label=f"⬇️ Baixar CSV — {ponto}",
+                    data=csv_p,
+                    file_name=f"{prefixo_key}_{ponto}_{datetime.now():%Y%m%d}.csv",
+                    mime="text/csv",
+                    key=f"dl_{prefixo_key}_{ponto}",
+                )
 
-            st.dataframe(
-                df_show,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Waybill": st.column_config.TextColumn("Waybill", width="medium"),
-                    "Urgência": st.column_config.TextColumn("Urgência", width="medium"),
-                    "Motivo da ocorrência": st.column_config.TextColumn("Motivo da ocorrência", width="large"),
-                    "Dias atraso": st.column_config.NumberColumn("Dias atraso", format="%d"),
-                    "Prazo": st.column_config.DatetimeColumn("Prazo", format="DD/MM/YYYY"),
-                    "Último rastreio": st.column_config.DatetimeColumn("Último rastreio", format="DD/MM HH:mm"),
-                },
+    # ── Sub-aba 1: com entregador ────────────────────────────────────
+    with sub_nominado:
+        st.caption("Pedidos que já foram expedidos para um entregador específico e não foram entregues.")
+
+        if not df_cob.empty:
+            resumo_nom = (
+                df_cob.groupby("Ponto (IATA)")
+                .agg(
+                    Supervisor=("Supervisor", "first"),
+                    Total=("Waybill", "count"),
+                    Entregadores=("Entregador", "nunique"),
+                    Criticos=("Dias atraso", lambda x: (x.fillna(0) >= 30).sum()),
+                    Mais_antigo=("Dias atraso", lambda x: x.max()),
+                )
+                .reset_index()
+                .sort_values("Total", ascending=False)
+                .rename(columns={"Criticos": "Críticos (30+d)", "Mais_antigo": "Mais antigo (dias)"})
             )
+            st.markdown('<div class="section-title">📍 Resumo por Ponto</div>', unsafe_allow_html=True)
+            st.dataframe(resumo_nom, use_container_width=True, hide_index=True)
+            st.divider()
 
-            # Export individual por ponto
-            csv_ponto = df_show.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label=f"⬇️ Baixar CSV — {ponto}",
-                data=csv_ponto,
-                file_name=f"cobranca_{ponto}_{datetime.now():%Y%m%d}.csv",
-                mime="text/csv",
-                key=f"dl_{ponto}",
-            )
+        _render_por_ponto(df_cob, "Ponto (IATA)", col_entregador="Entregador", prefixo_key="nominado")
 
-    st.divider()
+        st.divider()
+        st.markdown('<div class="section-title">⬇️ Export</div>', unsafe_allow_html=True)
+        col_e1, col_e2 = st.columns(2)
+        with col_e1:
+            if not df_cob.empty:
+                st.download_button(
+                    "⬇️ CSV completo (com entregador)",
+                    df_cob.to_csv(index=False).encode("utf-8"),
+                    f"cobranca_nominado_{datetime.now():%Y%m%d}.csv",
+                    mime="text/csv", key="dl_nom_completo",
+                )
+        with col_e2:
+            # WhatsApp — só pedidos com entregador
+            linhas_msg = []
+            for ponto, grp_ponto in df_cob.groupby("Ponto (IATA)"):
+                sup_msg = grp_ponto["Supervisor"].dropna().iloc[0] if not grp_ponto["Supervisor"].dropna().empty else "—"
+                linhas_msg.append(f"\n📍 *{ponto}* — {len(grp_ponto)} pedido(s) | Sup: {sup_msg}")
+                for entregador, grp_ent in grp_ponto.groupby("Entregador"):
+                    dias_max = grp_ent["Dias atraso"].max()
+                    dias_str = f"{int(dias_max)}d" if not pd.isna(dias_max) else "s/ prazo"
+                    linhas_msg.append(f"\n  👤 *{entregador}* — {len(grp_ent)} pedido(s) · max {dias_str}")
+                    alertas_e = grp_ent[grp_ent["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys())]
+                    normais_e = grp_ent[~grp_ent["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys())]
+                    if not alertas_e.empty:
+                        linhas_msg.append("    ⚠️ *ATENÇÃO — casos críticos:*")
+                        for _, row in alertas_e.sort_values("Dias atraso", ascending=False, na_position="last").iterrows():
+                            dias_wb = f"{int(row['Dias atraso'])}d" if not pd.isna(row["Dias atraso"]) else "s/ prazo"
+                            linhas_msg.append(f"    🚨 {row['Waybill']} · {dias_wb} · {MOTIVOS_ALERTA.get(str(row['Motivo (raw)']).strip(), '')}")
+                    if not normais_e.empty:
+                        if not alertas_e.empty:
+                            linhas_msg.append("    ─────────────────")
+                        for _, row in normais_e.sort_values("Dias atraso", ascending=False, na_position="last").iterrows():
+                            dias_wb = f"{int(row['Dias atraso'])}d" if not pd.isna(row["Dias atraso"]) else "s/ prazo"
+                            linhas_msg.append(f"    • {row['Waybill']} · {dias_wb}")
+            prazo_msg = prazo_resposta.strip() or "18h de hoje"
+            linhas_msg.append(f"\n{'─'*35}")
+            linhas_msg.append(f"⏰ Aguardo posicionamento até *{prazo_msg}*.")
+            linhas_msg.append("Confirme o recebimento e informe o status de cada pedido listado.")
+            if not df_cob.empty:
+                st.download_button(
+                    "📱 Lista WhatsApp (com entregador)",
+                    "\n".join(linhas_msg).encode("utf-8"),
+                    f"whatsapp_nominado_{datetime.now():%Y%m%d}.txt",
+                    mime="text/plain", key="dl_nom_whats",
+                )
+            st.caption("Críticos primeiro → pedidos normais → rodapé com prazo.")
 
-    # ── Export completo ───────────────────────────────────────────────
-    st.markdown('<div class="section-title">⬇️ Export Completo</div>', unsafe_allow_html=True)
-    col_exp1, col_exp2 = st.columns(2)
-
-    with col_exp1:
-        csv_completo = df_cob.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="⬇️ Baixar CSV completo (todos os pontos)",
-            data=csv_completo,
-            file_name=f"cobranca_todos_pontos_{datetime.now():%Y%m%d}.csv",
-            mime="text/csv",
-            key="dl_completo",
-        )
-
-    with col_exp2:
-        # ── Geração da mensagem de WhatsApp ──────────────────────────
-        # Melhoria 2: críticos separados dos normais por entregador
-        # Melhoria 3: atraso individual por waybill
-        # Melhoria 4: rodapé com prazo de resposta e instrução clara
-        linhas_msg = []
-
-        for ponto, grp_ponto in df_cob.groupby("Ponto (IATA)"):
-            supervisor_msg = grp_ponto["Supervisor"].dropna().iloc[0] if not grp_ponto["Supervisor"].dropna().empty else "—"
-            total_ponto_msg = len(grp_ponto)
-            linhas_msg.append(f"\n📍 *{ponto}* — {total_ponto_msg} pedido(s) | Sup: {supervisor_msg}")
-
-            for entregador, grp_ent in grp_ponto.groupby("Entregador"):
-                dias_max = grp_ent["Dias atraso"].max()
-                dias_str = f"{int(dias_max)}d" if not pd.isna(dias_max) else "s/ prazo"
-                total_ent = len(grp_ent)
-                linhas_msg.append(f"\n  👤 *{entregador}* — {total_ent} pedido(s) · max {dias_str}")
-
-                # Separar críticos (motivo de alerta) dos demais
-                alertas_ent = grp_ent[grp_ent["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys())]
-                normais_ent = grp_ent[~grp_ent["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys())]
-
-                # Melhoria 2: críticos primeiro, com seção própria
-                if not alertas_ent.empty:
-                    linhas_msg.append("    ⚠️ *ATENÇÃO — casos críticos:*")
-                    for _, row in alertas_ent.sort_values("Dias atraso", ascending=False, na_position="last").iterrows():
-                        motivo_fmt = MOTIVOS_ALERTA.get(str(row["Motivo (raw)"]).strip(), "")
-                        dias_wb = f"{int(row['Dias atraso'])}d" if not pd.isna(row["Dias atraso"]) else "s/ prazo"
-                        # Melhoria 3: atraso por waybill
-                        linhas_msg.append(f"    🚨 {row['Waybill']} · {dias_wb} · {motivo_fmt}")
-
-                # Pedidos normais
-                if not normais_ent.empty:
-                    if not alertas_ent.empty:
-                        linhas_msg.append("    ─────────────────")
-                    for _, row in normais_ent.sort_values("Dias atraso", ascending=False, na_position="last").iterrows():
-                        dias_wb = f"{int(row['Dias atraso'])}d" if not pd.isna(row["Dias atraso"]) else "s/ prazo"
-                        # Melhoria 3: atraso por waybill
-                        linhas_msg.append(f"    • {row['Waybill']} · {dias_wb}")
-
-        # Melhoria 4: rodapé com instrução e prazo
-        prazo_msg = prazo_resposta.strip() or "18h de hoje"
-        linhas_msg.append(f"\n{'─'*35}")
-        linhas_msg.append(f"⏰ Aguardo posicionamento até *{prazo_msg}*.")
-        linhas_msg.append("Confirme o recebimento e informe o status de cada pedido listado.")
-
-        texto_msg = "\n".join(linhas_msg)
-
-        st.download_button(
-            label="📱 Baixar lista .txt (para WhatsApp/grupos)",
-            data=texto_msg.encode("utf-8"),
-            file_name=f"cobranca_whatsapp_{datetime.now():%Y%m%d}.txt",
-            mime="text/plain",
-            key="dl_whatsapp",
-        )
+    # ── Sub-aba 2: parados no hub ────────────────────────────────────
+    with sub_parado:
         st.caption(
-            "Formato para o grupo do DSP: ponto → entregador → "
-            "casos críticos primeiro (🚨) → pedidos normais (•) com dias de atraso individuais → "
-            "rodapé com prazo de resposta."
+            "Chegaram no DSP (ponto de entrada) mas ainda não foram expedidos para nenhum entregador. "
+            "Cobrança deve ser feita ao gestor do DSP, não ao entregador."
         )
+        if df_hub_parado.empty:
+            st.info("Nenhum pedido parado no hub com os filtros aplicados.")
+        else:
+            resumo_hub = (
+                df_hub_parado.groupby("Ponto (IATA)")
+                .agg(
+                    Supervisor=("Supervisor", "first"),
+                    Total=("Waybill", "count"),
+                    Criticos=("Dias atraso", lambda x: (x.fillna(0) >= 14).sum()),
+                    Mais_antigo=("Dias atraso", lambda x: x.max()),
+                    Media_hub=("Dias no hub", lambda x: round(x.dropna().mean(), 1) if x.dropna().any() else None),
+                    Max_hub=("Dias no hub", lambda x: x.max()),
+                )
+                .reset_index()
+                .sort_values("Total", ascending=False)
+                .rename(columns={
+                    "Criticos": "Críticos (14+d)",
+                    "Mais_antigo": "Mais antigo p/ prazo (d)",
+                    "Media_hub": "Média dias no hub",
+                    "Max_hub": "Máx dias no hub",
+                })
+            )
+            st.markdown('<div class="section-title">📍 Resumo por Ponto</div>', unsafe_allow_html=True)
+            st.caption("'Dias no hub' = tempo desde o inbound no ponto. 'Mais antigo p/ prazo' = atraso pelo compromisso com o cliente.")
+            st.dataframe(resumo_hub, use_container_width=True, hide_index=True)
+            st.divider()
+            _render_por_ponto(df_hub_parado, "Ponto (IATA)", col_entregador=None, prefixo_key="hub_parado")
+            st.divider()
+            col_hub1, col_hub2 = st.columns(2)
+            with col_hub1:
+                st.download_button(
+                    "⬇️ CSV — Parados no hub",
+                    df_hub_parado.to_csv(index=False).encode("utf-8"),
+                    f"cobranca_hub_parado_{datetime.now():%Y%m%d}.csv",
+                    mime="text/csv", key="dl_hub_parado",
+                )
+            with col_hub2:
+                linhas_hub = []
+                for ponto_h, grp_h in df_hub_parado.groupby("Ponto (IATA)"):
+                    sup_h = grp_h["Supervisor"].dropna().iloc[0] if not grp_h["Supervisor"].dropna().empty else "—"
+                    max_hub = grp_h["Dias no hub"].max()
+                    max_hub_str = f"{int(max_hub)}d no hub" if not pd.isna(max_hub) else ""
+                    linhas_hub.append(f"\n📍 *{ponto_h}* — {len(grp_h)} pedido(s) parado(s) | Sup: {sup_h}")
+                    if max_hub_str:
+                        linhas_hub.append(f"   ⏱ Mais antigo no hub: {max_hub_str}")
+                    alertas_h = grp_h[grp_h["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys())]
+                    if not alertas_h.empty:
+                        linhas_hub.append(f"   ⚠️ *{len(alertas_h)} caso(s) crítico(s)*")
+                    for _, row_h in grp_h.sort_values("Dias no hub", ascending=False, na_position="last").iterrows():
+                        dias_h = f"{int(row_h['Dias no hub'])}d hub" if not pd.isna(row_h["Dias no hub"]) else "hub s/ data"
+                        dias_p = f"{int(row_h['Dias atraso'])}d atraso" if not pd.isna(row_h["Dias atraso"]) else "s/ prazo"
+                        motivo_h = MOTIVOS_ALERTA.get(str(row_h["Motivo (raw)"]).strip(), "")
+                        sufixo_h = f" 🚨 {motivo_h}" if motivo_h else ""
+                        linhas_hub.append(f"   • {row_h['Waybill']} · {dias_h} · {dias_p}{sufixo_h}")
+                prazo_msg_h = prazo_resposta.strip() or "18h de hoje"
+                linhas_hub.append(f"\n{'─'*35}")
+                linhas_hub.append(f"⏰ Aguardo posicionamento até *{prazo_msg_h}*.")
+                linhas_hub.append("Solicito expedição ou justificativa para cada pedido acima.")
+                st.download_button(
+                    "📱 Lista WhatsApp — Parados no hub",
+                    "\n".join(linhas_hub).encode("utf-8"),
+                    f"whatsapp_hub_parado_{datetime.now():%Y%m%d}.txt",
+                    mime="text/plain", key="dl_hub_parado_whats",
+                )
+                st.caption("Mostra dias no hub + dias de atraso por prazo — dois ângulos de cobrança para o gestor do DSP.")
+
+    # ── Sub-aba 3: em rota sem responsável ───────────────────────────
+    with sub_rota:
+        st.caption(
+            "Foram expedidos para rota de entrega mas sem entregador registrado no sistema. "
+            "O pacote saiu, mas não há quem cobrar nominalmente — investigar no DSP quem pegou a rota."
+        )
+        if df_hub_rota.empty:
+            st.info("Nenhum pedido nessa situação com os filtros aplicados.")
+        else:
+            resumo_rota = (
+                df_hub_rota.groupby("Ponto (IATA)")
+                .agg(
+                    Supervisor=("Supervisor", "first"),
+                    Total=("Waybill", "count"),
+                    Criticos=("Dias atraso", lambda x: (x.fillna(0) >= 14).sum()),
+                    Mais_antigo=("Dias atraso", lambda x: x.max()),
+                )
+                .reset_index()
+                .sort_values("Total", ascending=False)
+                .rename(columns={"Criticos": "Críticos (14+d)", "Mais_antigo": "Mais antigo (dias)"})
+            )
+            st.markdown('<div class="section-title">📍 Resumo por Ponto</div>', unsafe_allow_html=True)
+            st.dataframe(resumo_rota, use_container_width=True, hide_index=True)
+            st.divider()
+            _render_por_ponto(df_hub_rota, "Ponto (IATA)", col_entregador=None, prefixo_key="hub_rota")
+            st.divider()
+            col_rota1, col_rota2 = st.columns(2)
+            with col_rota1:
+                st.download_button(
+                    "⬇️ CSV — Em rota s/ responsável",
+                    df_hub_rota.to_csv(index=False).encode("utf-8"),
+                    f"cobranca_hub_rota_{datetime.now():%Y%m%d}.csv",
+                    mime="text/csv", key="dl_hub_rota",
+                )
+            with col_rota2:
+                linhas_rota = []
+                for ponto_r, grp_r in df_hub_rota.groupby("Ponto (IATA)"):
+                    sup_r = grp_r["Supervisor"].dropna().iloc[0] if not grp_r["Supervisor"].dropna().empty else "—"
+                    linhas_rota.append(f"\n📍 *{ponto_r}* — {len(grp_r)} pedido(s) em rota s/ entregador | Sup: {sup_r}")
+                    linhas_rota.append("   ⚠️ Esses pedidos saíram para rota mas *não têm entregador registrado*.")
+                    linhas_rota.append("   Solicito identificação de quem realizou a rota e posicionamento.")
+                    for _, row_r in grp_r.groupby("Cidade").apply(lambda x: x).sort_values("Dias atraso", ascending=False, na_position="last").iterrows():
+                        dias_r = f"{int(row_r['Dias atraso'])}d" if not pd.isna(row_r["Dias atraso"]) else "s/ prazo"
+                        cidade_r = row_r["Cidade"] or "—"
+                        linhas_rota.append(f"   • {row_r['Waybill']} · {dias_r} · {cidade_r}")
+                prazo_msg_r = prazo_resposta.strip() or "18h de hoje"
+                linhas_rota.append(f"\n{'─'*35}")
+                linhas_rota.append(f"⏰ Aguardo posicionamento até *{prazo_msg_r}*.")
+                st.download_button(
+                    "📱 Lista WhatsApp — Em rota s/ responsável",
+                    "\n".join(linhas_rota).encode("utf-8"),
+                    f"whatsapp_hub_rota_{datetime.now():%Y%m%d}.txt",
+                    mime="text/plain", key="dl_hub_rota_whats",
+                )
+                st.caption("Waybills agrupados por cidade — facilita o DSP identificar qual rota e entregador.")
+
+    # ── Sub-aba 4: anomalia sem responsável ─────────────────────────
+    with sub_anomalia_sr:
+        st.caption(
+            "Pedidos com anomalia registrada mas sem entregador nominado. "
+            "São os casos mais difíceis de rastrear — falha ocorreu mas não há responsável claro no sistema."
+        )
+        if df_hub_anomalia.empty:
+            st.info("Nenhum pedido nessa situação com os filtros aplicados.")
+        else:
+            resumo_anom = (
+                df_hub_anomalia.groupby("Ponto (IATA)")
+                .agg(
+                    Supervisor=("Supervisor", "first"),
+                    Total=("Waybill", "count"),
+                    Criticos=("Dias atraso", lambda x: (x.fillna(0) >= 14).sum()),
+                    Mais_antigo=("Dias atraso", lambda x: x.max()),
+                )
+                .reset_index()
+                .sort_values("Mais_antigo", ascending=False)
+                .rename(columns={"Criticos": "Críticos (14+d)", "Mais_antigo": "Mais antigo (dias)"})
+            )
+            st.markdown('<div class="section-title">📍 Resumo por Ponto</div>', unsafe_allow_html=True)
+            st.dataframe(resumo_anom, use_container_width=True, hide_index=True)
+            st.divider()
+            _render_por_ponto(df_hub_anomalia, "Ponto (IATA)", col_entregador=None, prefixo_key="hub_anomalia")
+            st.divider()
+            st.download_button(
+                "⬇️ CSV — Anomalia s/ responsável",
+                df_hub_anomalia.to_csv(index=False).encode("utf-8"),
+                f"cobranca_anomalia_sr_{datetime.now():%Y%m%d}.csv",
+                mime="text/csv", key="dl_hub_anomalia",
+            )
