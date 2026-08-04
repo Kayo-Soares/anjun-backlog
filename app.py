@@ -22,9 +22,15 @@ lista MOTIVOS_JA_RESOLVIDOS. Isso evita que outro app/BI que se conecte
 nesse Supabase esqueça de aplicar o mesmo corte -- a regra de negócio
 agora mora num único lugar (o banco). MOTIVOS_JA_RESOLVIDOS continua
 aqui só para exibir a lista pro usuário no st.caption.
+
+NOTA (04/08): adicionada aba "Cobrança IATA" com lista completa de
+waybills por ponto/entregador, filtros interativos, indicador de
+urgência e export CSV -- voltada para cobrança operacional dos DSPs
+(carteira ex-Helson e futuramente qualquer supervisor configurável).
 --------------------------------------------------------------------
 """
 
+import io
 import json
 import os
 import re
@@ -45,15 +51,8 @@ ANJUN_RED = "#E80115"
 COR_CRITICO = "#C2410C"
 COR_EXTRAVIO = "#C00000"
 
-# UFs da regional que a Anjun responde -- fixo, não vem do banco, porque
-# qualquer outro estado que aparecer nos dados é fora do escopo da operação.
 UFS_REGIONAL = ["AM", "AP", "PA", "RR"]
 
-# Motivos que ja saem da responsabilidade operacional ativa (perda confirmada
-# ou pacote que nem e nosso) -- confirmado com o time em 24/07. "Backlog Ativo"
-# exclui esses; "Backlog Total" mostra tudo, sem esse corte.
-# A fonte da verdade desse filtro agora é a view SQL `backlog_ativo`
-# (ver migração create_backlog_ativo_view). Mantido aqui só para exibição.
 MOTIVOS_JA_RESOLVIDOS = [
     "Perda confirmada - Aguardando indenização",
     "Perda confirmada-Fake delivery",
@@ -99,7 +98,6 @@ st.markdown(
         background-color: {ANJUN_GREEN_DARK}; border-color: {ANJUN_GREEN_DARK};
     }}
 
-    /* Cartões ao redor de cada gráfico */
     div[data-testid="stVerticalBlockBorderWrapper"] {{
         border-radius: 14px !important;
         border-color: #E7EEE9 !important;
@@ -123,9 +121,12 @@ st.markdown(
         display: flex; align-items: center; gap: 0.5rem;
     }}
 
-    /* Visão DSP: fundo verde-claro fixo (poster pra compartilhar), cartoes
-       brancos por cima, independente do tema claro/escuro do usuario.
-       .st-key-dsp_view_bg vem de st.container(key="dsp_view_bg") no Python. */
+    /* Urgência na aba Cobrança */
+    .urgencia-critico  {{ color: #C00000; font-weight: 700; }}
+    .urgencia-alto     {{ color: #C2410C; font-weight: 700; }}
+    .urgencia-medio    {{ color: #D4A017; font-weight: 600; }}
+    .urgencia-baixo    {{ color: #009946; font-weight: 500; }}
+
     .st-key-dsp_view_bg {{
         background: linear-gradient(180deg, #EAF5EC 0%, #F5FAF6 100%);
         border-radius: 16px;
@@ -157,7 +158,7 @@ with col_title:
 
 
 # ---------------------------------------------------------------------
-# Conexão com o banco (mesmo projeto Supabase dos outros apps)
+# Conexão com o banco
 # ---------------------------------------------------------------------
 @st.cache_resource
 def get_connection():
@@ -189,9 +190,7 @@ mapping = load_column_mapping()
 
 
 # ---------------------------------------------------------------------
-# Casamento de colunas por TEXTO (não por posição fixa) -- tolera
-# colunas extras no meio do arquivo e lida com cabeçalhos duplicados
-# casando na ordem em que aparecem.
+# Casamento de colunas por TEXTO
 # ---------------------------------------------------------------------
 def resolver_colunas(header_row, mapping):
     posicoes = {}
@@ -200,7 +199,7 @@ def resolver_colunas(header_row, mapping):
         posicoes.setdefault(h, []).append(idx)
 
     usados = {}
-    resolvido = []  # (slug, indice_no_arquivo ou None)
+    resolvido = []
     faltando = []
     for m in mapping:
         texto = m["original"]
@@ -242,15 +241,8 @@ def parse_periodo_from_filename(filename):
 
 
 def insert_backlog(data_df, resolvido, arquivo_origem, periodo, batch_size=1000, progress_cb=None):
-    """Upsert por numero_do_waybill -- reenviar um arquivo, ou um pedido
-    que já apareceu numa carga anterior, nunca duplica: atualiza a linha.
-
-    Alem disso, remove sozinho qualquer linha de HOJE que veio de um
-    arquivo diferente do que está sendo subido agora -- isso evita que um
-    upload de manhã e outro à tarde no mesmo dia se somem (o backlog da
-    tarde deve SUBSTITUIR o da manhã, não empilhar em cima)."""
     slugs = [s for s, _ in resolvido]
-    idxs = [i for _, i in resolvido]  # pode conter None se a coluna nao existir no arquivo
+    idxs = [i for _, i in resolvido]
     cols_sql = ["arquivo_origem", "periodo_referencia", "row_num"] + slugs
     set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols_sql if c != "numero_do_waybill")
     set_clause += ", data_importacao = now(), data_snapshot = CURRENT_DATE"
@@ -284,7 +276,6 @@ def insert_backlog(data_df, resolvido, arquivo_origem, periodo, batch_size=1000,
         cur.execute("SELECT count(*) FROM public.backlog")
         apos_upsert = cur.fetchone()[0]
 
-    # Limpeza: remove sobras de um upload ANTERIOR de hoje, de outro arquivo
     removidos = 0
     with conn.cursor() as cur:
         cur.execute(
@@ -299,14 +290,6 @@ def insert_backlog(data_df, resolvido, arquivo_origem, periodo, batch_size=1000,
 
 
 def registrar_snapshot_historico():
-    """Grava (ou atualiza) o resumo agregado do dia na backlog_historico_diario.
-    Chamada automaticamente ao fim de cada upload -- é o que dá origem ao
-    gráfico de tendência (backlog crescendo ou caindo ao longo do tempo).
-
-    Usa backlog_atual (não backlog_ativo) de propósito: o histórico de
-    tendência deve refletir o volume bruto do dia, igual sempre fez --
-    quem quiser ver a tendência já filtrada por "Backlog Ativo" faz esse
-    corte na hora de ler o histórico, não na hora de gravar."""
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute("""
@@ -333,7 +316,73 @@ def registrar_snapshot_historico():
         """, {"uf_regional": UFS_REGIONAL})
 
 
-tab_upload, tab_painel, tab_dsp = st.tabs(["Upload da Base", "Painel de Backlog", "Visão DSP"])
+# ---------------------------------------------------------------------
+# Helpers da aba Cobrança
+# ---------------------------------------------------------------------
+def _urgencia_label(dias):
+    """Classifica urgência com base nos dias de atraso."""
+    if dias is None or pd.isna(dias):
+        return "⚠️ S/ prazo", "urgencia-medio"
+    dias = int(dias)
+    if dias >= 30:
+        return f"🔴 {dias}d — CRÍTICO", "urgencia-critico"
+    if dias >= 14:
+        return f"🟠 {dias}d — Alto", "urgencia-alto"
+    if dias >= 5:
+        return f"🟡 {dias}d — Médio", "urgencia-medio"
+    if dias >= 0:
+        return f"🟢 {dias}d — Baixo", "urgencia-baixo"
+    return f"⏳ dentro do prazo ({abs(dias)}d)", "urgencia-baixo"
+
+
+def _df_cobranca(supervisor_filtro=None):
+    """
+    Busca no banco todos os pedidos em backlog do snapshot mais recente,
+    filtrados pelos pontos de um supervisor específico (ou todos, se None).
+    Retorna DataFrame pronto para exibição.
+    """
+    params = {"uf_regional": UFS_REGIONAL}
+    filtro_supervisor = ""
+    if supervisor_filtro:
+        filtro_supervisor = "AND s.supervisor = ANY(%(supervisores)s)"
+        params["supervisores"] = supervisor_filtro
+
+    sql = f"""
+        SELECT
+            b.ponto_de_entrega                          AS "Ponto (IATA)",
+            s.supervisor                                AS "Supervisor",
+            b.entregador                                AS "Entregador",
+            b.numero_do_waybill                         AS "Waybill",
+            b.cidade_do_destinatario                    AS "Cidade",
+            b.estado_do_destinatario                    AS "UF",
+            b.horario_em_que_deve_ser_entregue          AS "Prazo",
+            b.ultimo_data_de_rastreio                   AS "Último rastreio",
+            b.ultimo_rastreio                           AS "Último status",
+            b.status_do_pacote                          AS "Status do pacote",
+            (CURRENT_DATE - TO_DATE(
+                LEFT(b.horario_em_que_deve_ser_entregue, 10), 'YYYY-MM-DD'
+            ))                                          AS "Dias atraso",
+            b.data_snapshot                             AS "Snapshot"
+        FROM public.backlog b
+        LEFT JOIN public.supervisores s
+            ON s.ponto = b.ponto_de_entrega
+        WHERE b.data_snapshot = (SELECT MAX(data_snapshot) FROM public.backlog)
+          AND b.ponto_de_entrega IS NOT NULL
+          {filtro_supervisor}
+        ORDER BY b.ponto_de_entrega, "Dias atraso" DESC NULLS LAST
+    """
+    return run_query(sql, params)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# TABS
+# ─────────────────────────────────────────────────────────────────────
+tab_upload, tab_painel, tab_dsp, tab_cobranca = st.tabs([
+    "Upload da Base",
+    "Painel de Backlog",
+    "Visão DSP",
+    "📋 Cobrança IATA",
+])
 
 # ===================== ABA UPLOAD =====================
 def render_upload():
@@ -417,14 +466,13 @@ def render_upload():
                 st.balloons()
                 st.cache_data.clear()
 
-# ===================== ABA PAINEL =====================
 with tab_upload:
     render_upload()
 
+# ===================== ABA PAINEL =====================
 with tab_painel:
     st.subheader("Painel de Backlog")
 
-    # -------------------- Aviso de atualização --------------------
     snap_info = run_query("SELECT max(data_snapshot) AS ultimo FROM public.backlog")
     ultimo_snapshot = snap_info.iloc[0]["ultimo"] if not snap_info.empty else None
     hoje = datetime.now().date()
@@ -443,13 +491,10 @@ with tab_painel:
     if ultimo_snapshot is None:
         st.stop()
 
-    # -------------------- Backlog Ativo vs Total --------------------
     modo_backlog = st.radio(
         "Visão", ["Backlog Ativo (padrão)", "Backlog Total (inclui perdas confirmadas)"],
         horizontal=True,
     )
-    # Fonte da verdade do filtro "Ativo" agora é a view SQL backlog_ativo
-    # (ver migração create_backlog_ativo_view), não mais um WHERE em Python.
     tabela_fonte = "backlog_ativo" if modo_backlog.startswith("Backlog Ativo") else "backlog_atual"
     if modo_backlog.startswith("Backlog Ativo"):
         st.caption(
@@ -457,10 +502,6 @@ with tab_painel:
             "(confirmado com o time em 24/07): " + "; ".join(MOTIVOS_JA_RESOLVIDOS)
         )
 
-    # -------------------- Filtros --------------------
-    # As opções dos multiselects continuam vindo de backlog_atual (base
-    # completa) de propósito -- mesmo no modo Ativo, o usuário deve poder
-    # ver/filtrar por qualquer valor que já existiu na base.
     opcoes_uf = UFS_REGIONAL
     opcoes_ponto = run_query("SELECT DISTINCT ponto_de_entrada AS v FROM public.backlog_atual WHERE ponto_de_entrada IS NOT NULL ORDER BY 1")["v"].tolist()
     opcoes_supervisor = run_query("SELECT DISTINCT supervisor AS v FROM public.backlog_atual WHERE supervisor IS NOT NULL ORDER BY 1")["v"].tolist()
@@ -526,7 +567,6 @@ with tab_painel:
             params,
         ).iloc[0]
 
-        # -------------------- KPIs --------------------
         st.markdown('<div class="section-title">📊 Visão Geral / 总览</div>', unsafe_allow_html=True)
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Pacotes em backlog", f"{int(kpi['total']):,}".replace(",", "."))
@@ -537,9 +577,8 @@ with tab_painel:
 
         st.divider()
 
-        # -------------------- Tendência --------------------
         st.markdown('<div class="section-title">📈 Tendência do Backlog / 积压趋势</div>', unsafe_allow_html=True)
-        st.caption("Um ponto por dia (calendário, não por upload) — se subir 2x no mesmo dia, conta como 1 ponto.")
+        st.caption("Um ponto por dia (calendário, não por upload) -- se subir 2x no mesmo dia, conta como 1 ponto.")
         hist = run_query("SELECT * FROM public.backlog_historico_diario ORDER BY data_snapshot")
         if len(hist) < 2:
             with st.container(border=True):
@@ -548,7 +587,7 @@ with tab_painel:
         else:
             eixo_x = list(hist["data_snapshot"])
             rotulos_x = [d.strftime("%d/%m") for d in eixo_x]
-            mostrar_todos_rotulos = len(hist) <= 8  # evita poluir quando acumular muitos dias
+            mostrar_todos_rotulos = len(hist) <= 8
 
             def _estilo_eixo(fig, altura_extra=0.0):
                 fig.update_xaxes(
@@ -561,14 +600,12 @@ with tab_painel:
                 return fig
 
             def _rotulos_pontos(y_vals):
-                """Mostra o valor em todo ponto se tiver poucos dias; senão, só no primeiro e no último."""
                 if mostrar_todos_rotulos:
                     return [f"{int(v):,}".replace(",", ".") for v in y_vals]
                 return [f"{int(v):,}".replace(",", ".") if i in (0, len(y_vals) - 1) else ""
                         for i, v in enumerate(y_vals)]
 
             def _delta_badge(serie, inverso_bom=True):
-                """▲/▼ + variação % do último ponto vs penúltimo."""
                 if len(serie) < 2 or not serie.iloc[-2]:
                     return ""
                 var = (serie.iloc[-1] - serie.iloc[-2]) / serie.iloc[-2] * 100
@@ -579,7 +616,6 @@ with tab_painel:
 
             col_t1, col_t2 = st.columns(2)
 
-            # ============ Crítico + Extravio (atenção) ============
             with col_t1, st.container(border=True):
                 st.markdown('<div class="chart-title">🚨 CRÍTICO + EXTRAVIO — ATENÇÃO</div>', unsafe_allow_html=True)
                 badge_extravio = _delta_badge(hist["extravio"])
@@ -619,7 +655,6 @@ with tab_painel:
                 )
                 st.plotly_chart(_estilo_eixo(fig), use_container_width=True)
 
-            # ============ 0-4 dias + 5-13 dias (saudável) ============
             with col_t2, st.container(border=True):
                 st.markdown('<div class="chart-title">🟢 0-4 E 05-13 DIAS — SAUDÁVEL</div>', unsafe_allow_html=True)
                 badge_d0_4 = _delta_badge(hist["d0_4"], inverso_bom=False)
@@ -661,7 +696,6 @@ with tab_painel:
 
         st.divider()
 
-        # -------------------- Faixa x Responsável --------------------
         st.markdown('<div class="section-title">👤 Backlog por Responsável, detalhado por faixa / 按负责人及天数分布</div>', unsafe_allow_html=True)
         df_sf = run_query(
             f"""SELECT COALESCE(supervisor, '(sem responsável)') AS supervisor, faixa_recebimento, count(*) AS n
@@ -676,16 +710,16 @@ with tab_painel:
                 for faixa in ordem_faixa:
                     sub = df_sf[df_sf["faixa_recebimento"] == faixa].set_index("supervisor").reindex(ordem_sup).fillna(0)
                     fig.add_trace(go.Bar(name=faixa, x=ordem_sup, y=sub["n"], marker_color=cor_faixa[faixa]))
-                fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#6B7A72"),
-barmode="stack", height=360, margin=dict(l=10, r=10, t=10, b=10),
-                                   legend=dict(orientation="h", yanchor="bottom", y=1.02))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#6B7A72"),
+                    barmode="stack", height=360, margin=dict(l=10, r=10, t=10, b=10),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02))
                 st.plotly_chart(fig, use_container_width=True)
-        st.caption("Colunas: `supervisor` (via `ponto_de_entrada`) × `faixa_recebimento`. Mostra se o volume de um responsável é saudável (verde) ou concentrado em crítico/extravio (laranja escuro/vermelho).")
+        st.caption("Colunas: `supervisor` (via `ponto_de_entrada`) × `faixa_recebimento`.")
 
         st.divider()
 
-        # -------------------- Distribuições --------------------
         st.markdown('<div class="section-title">📐 Distribuições / 分布</div>', unsafe_allow_html=True)
         colA, colB = st.columns(2)
         with colA, st.container(border=True):
@@ -697,32 +731,24 @@ barmode="stack", height=360, margin=dict(l=10, r=10, t=10, b=10),
             )
             df_faixa["ordem"] = df_faixa["faixa_recebimento"].apply(lambda x: ordem_faixa.index(x) if x in ordem_faixa else 99)
             df_faixa = df_faixa.sort_values("ordem")
-            # Trocado de pizza pra barra horizontal (30/07): com 4 faixas de
-            # tamanho muito desigual (ex: 65% vs 1,4%), pizza nunca deixa a
-            # fatia pequena legível, nao importa o ajuste de rótulo -- é
-            # limitação estrutural do gráfico, não de estilo. Barra também
-            # preserva a ordem de gravidade (0-4 -> extravio), que pizza não
-            # comunica. Valor + % ficam escritos ao lado de cada barra, onde
-            # sempre há espaço (ao contrário da fatia pequena de uma pizza).
             pct_faixa = 100 * df_faixa["n"] / df_faixa["n"].sum()
             rotulos_faixa = [f"{n:,}".replace(",", ".") + f"  ({p:.1f}%)" for n, p in zip(df_faixa["n"], pct_faixa)]
             fig = go.Figure(go.Bar(
                 x=df_faixa["n"], y=df_faixa["faixa_recebimento"], orientation="h",
                 marker_color=[cor_faixa.get(f, "#999") for f in df_faixa["faixa_recebimento"]],
                 text=rotulos_faixa, textposition="outside", cliponaxis=False,
-                hovertemplate="%{y}<br>%{x:,} pacotes<extra></extra>",
             ))
-            fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#6B7A72"),
-height=280, margin=dict(l=10, r=95, t=10, b=10), showlegend=False,
-                               xaxis=dict(visible=False),
-                               yaxis=dict(autorange="reversed", automargin=True))
+                height=280, margin=dict(l=10, r=95, t=10, b=10), showlegend=False,
+                xaxis=dict(visible=False),
+                yaxis=dict(autorange="reversed", automargin=True))
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("Coluna: `faixa_recebimento` (`tempo_de_inbound_no_ponto` vs hoje)")
 
         with colB, st.container(border=True):
             st.markdown('<div class="chart-title">DIAS SEM MOVIMENTAÇÃO</div>', unsafe_allow_html=True)
-            st.caption("Diferente da faixa ao lado: aqui é *quando foi o último rastreio*, não *quando chegou*. Um pacote pode ter chegado há pouco mas já estar sem mexer.")
+            st.caption("Diferente da faixa ao lado: aqui é *quando foi o último rastreio*, não *quando chegou*.")
             df_mov = run_query(
                 f"""SELECT
                       CASE WHEN dias_sem_movimentacao <= 2 THEN '0 a 2 dias'
@@ -743,15 +769,14 @@ height=280, margin=dict(l=10, r=95, t=10, b=10), showlegend=False,
                 marker_color=[cores_mov[ordem_mov.index(f)] for f in df_mov["faixa_mov"]],
                 text=[f"{v:,}".replace(",", ".") for v in df_mov["n"]], textposition="outside", cliponaxis=False,
             ))
-            fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#6B7A72"),
-height=320, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Pacotes")
+                height=320, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Pacotes")
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("Coluna: `dias_sem_movimentacao` (`ultimo_data_de_rastreio` vs hoje)")
 
         st.divider()
 
-        # -------------------- Geografia e rede --------------------
         st.markdown('<div class="section-title">🗺️ Geografia e Rede / 地理与网点</div>', unsafe_allow_html=True)
         colC, colD = st.columns(2)
         with colC, st.container(border=True):
@@ -763,11 +788,10 @@ height=320, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Pacotes")
             )
             fig = go.Figure(go.Bar(x=df_uf["grupo"], y=df_uf["n"], marker_color=ANJUN_GREEN_DARK,
                                     text=[f"{v:,}".replace(",", ".") for v in df_uf["n"]], textposition="outside", cliponaxis=False))
-            fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#6B7A72"),
-height=340, margin=dict(l=10, r=10, t=10, b=10))
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#6B7A72"), height=340, margin=dict(l=10, r=10, t=10, b=10))
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("Coluna: `estado_do_ponto_de_entrada`")
 
         with colD, st.container(border=True):
             st.markdown('<div class="chart-title">POR PONTO DE ENTRADA / DSP (TOP 15)</div>', unsafe_allow_html=True)
@@ -778,21 +802,18 @@ height=340, margin=dict(l=10, r=10, t=10, b=10))
             )
             fig = go.Figure(go.Bar(x=df_dsp["n"], y=df_dsp["grupo"], orientation="h", marker_color=COR_CRITICO,
                                     text=[f"{v:,}".replace(",", ".") for v in df_dsp["n"]], textposition="outside", cliponaxis=False))
-            fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#6B7A72"),
-height=340, margin=dict(l=10, r=65, t=10, b=10))
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#6B7A72"), height=340, margin=dict(l=10, r=65, t=10, b=10))
             fig.update_yaxes(autorange="reversed", automargin=True)
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("Coluna: `ponto_de_entrada` (não `ponto_de_entrega` -- a maioria do backlog ainda não tem ponto final)")
 
         st.divider()
 
-        # -------------------- Cliente e motivo --------------------
         st.markdown('<div class="section-title">🏷️ Cliente e Motivo / 客户与原因</div>', unsafe_allow_html=True)
         colE, colF = st.columns(2)
         with colE, st.container(border=True):
             st.markdown('<div class="chart-title">POR CLIENTE MERCHANT (TOP 15)</div>', unsafe_allow_html=True)
-            st.caption("No painel de referência isso estava rotulado \"Status do Pacote\" -- os valores eram nomes de empresa, corrigido aqui.")
             df_merchant = run_query(
                 f"""SELECT nome_do_cliente_merchant AS grupo, count(*) AS n FROM public.{tabela_fonte} {where_sql}
                     {and_or_where} nome_do_cliente_merchant IS NOT NULL GROUP BY grupo ORDER BY n DESC LIMIT 15""",
@@ -800,16 +821,14 @@ height=340, margin=dict(l=10, r=65, t=10, b=10))
             )
             fig = go.Figure(go.Bar(x=df_merchant["n"], y=df_merchant["grupo"], orientation="h", marker_color=ANJUN_GREEN,
                                     text=[f"{v:,}".replace(",", ".") for v in df_merchant["n"]], textposition="outside", cliponaxis=False))
-            fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#6B7A72"),
-height=380, margin=dict(l=10, r=65, t=10, b=10))
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#6B7A72"), height=380, margin=dict(l=10, r=65, t=10, b=10))
             fig.update_yaxes(autorange="reversed", automargin=True)
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("Coluna: `nome_do_cliente_merchant`")
 
         with colF, st.container(border=True):
             st.markdown('<div class="chart-title">MOTIVO DA OCORRÊNCIA — SÓ CRÍTICO + EXTRAVIO</div>', unsafe_allow_html=True)
-            st.caption("Coluna nova nessa análise: hoje não era usada. Mostra só os pacotes em atenção (14+ dias), pra separar 'perda confirmada' (financeiro) de 'endereço errado' (operacional).")
             df_motivo = run_query(
                 f"""SELECT motivo_da_ocorrencia AS grupo, count(*) AS n FROM public.{tabela_fonte} {where_sql}
                     {and_or_where} faixa_recebimento IN ('14 a 20 dias (Crítico)','Mais de 20 (Extravio)')
@@ -822,16 +841,14 @@ height=380, margin=dict(l=10, r=65, t=10, b=10))
             else:
                 fig = go.Figure(go.Bar(x=df_motivo["n"], y=df_motivo["grupo"], orientation="h", marker_color=COR_EXTRAVIO,
                                         text=[f"{v:,}".replace(",", ".") for v in df_motivo["n"]], textposition="outside", cliponaxis=False))
-                fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#6B7A72"),
-height=380, margin=dict(l=10, r=65, t=10, b=10))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#6B7A72"), height=380, margin=dict(l=10, r=65, t=10, b=10))
                 fig.update_yaxes(autorange="reversed", automargin=True)
                 st.plotly_chart(fig, use_container_width=True)
-            st.caption("Coluna: `motivo_da_ocorrencia`, filtrado por `faixa_recebimento`")
 
         st.divider()
 
-        # -------------------- Status --------------------
         st.markdown('<div class="section-title">📦 Status do Pacote / 运单状态</div>', unsafe_allow_html=True)
         df_status = run_query(
             f"""SELECT status_do_pacote AS grupo, count(*) AS n FROM public.{tabela_fonte} {where_sql}
@@ -841,16 +858,14 @@ height=380, margin=dict(l=10, r=65, t=10, b=10))
         with st.container(border=True):
             fig = go.Figure(go.Bar(x=df_status["n"], y=df_status["grupo"], orientation="h", marker_color=ANJUN_GREEN_DARK,
                                     text=[f"{v:,}".replace(",", ".") for v in df_status["n"]], textposition="outside", cliponaxis=False))
-            fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#6B7A72"),
-height=280, margin=dict(l=10, r=65, t=10, b=10))
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#6B7A72"), height=280, margin=dict(l=10, r=65, t=10, b=10))
             fig.update_yaxes(autorange="reversed", automargin=True)
             st.plotly_chart(fig, use_container_width=True)
-        st.caption("Coluna: `status_do_pacote`")
 
         st.divider()
 
-        # -------------------- Tabela de críticos --------------------
         st.markdown('<div class="section-title">🚨 Pacotes mais críticos (ordenado do mais parado pro menos) / 最紧急包裹</div>', unsafe_allow_html=True)
         criticos = run_query(
             f"""SELECT numero_do_waybill AS "Waybill", ponto_de_entrada AS "Ponto de Entrada",
@@ -892,15 +907,12 @@ with tab_dsp:
                 """,
                 unsafe_allow_html=True,
             )
-            st.caption(f"Regional: {', '.join(UFS_REGIONAL)} — apenas os estados que a Anjun responde nessa operação.")
+            st.caption(f"Regional: {', '.join(UFS_REGIONAL)} -- apenas os estados que a Anjun responde nessa operação.")
 
             modo_dsp = st.radio(
                 "Visão", ["Backlog Ativo (padrão)", "Backlog Total (inclui perdas confirmadas)"],
                 horizontal=True, key="modo_dsp",
             )
-            # Idem ao Painel: a fonte da verdade do filtro "Ativo" é a view
-            # SQL backlog_ativo, não mais um AND motivo_da_ocorrencia != ALL(...)
-            # reaplicado em cada query desta aba.
             tabela_dsp = "backlog_ativo" if modo_dsp.startswith("Backlog Ativo") else "backlog_atual"
 
             cor_faixa = {
@@ -925,9 +937,9 @@ with tab_dsp:
                 )
                 fig = go.Figure(go.Bar(x=df["n"], y=df["grupo"], orientation="h", marker_color=COR_EXTRAVIO,
                                         text=[f"{v:,}".replace(",", ".") for v in df["n"]], textposition="outside", cliponaxis=False))
-                fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="#6B7A72"),
-    height=260, margin=dict(l=10, r=30, t=5, b=5))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#6B7A72"), height=260, margin=dict(l=10, r=30, t=5, b=5))
                 fig.update_yaxes(autorange="reversed", automargin=True)
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -937,9 +949,9 @@ with tab_dsp:
                     mode="number", value=total_dsp,
                     number={"valueformat": ",", "font": {"size": 42, "color": COR_EXTRAVIO}},
                 ))
-                fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="#6B7A72"),
-    height=260, margin=dict(l=10, r=10, t=30, b=5))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#6B7A72"), height=260, margin=dict(l=10, r=10, t=30, b=5))
                 st.plotly_chart(fig, use_container_width=True)
 
             with r1c3, st.container(border=True):
@@ -951,11 +963,6 @@ with tab_dsp:
                 )
                 df["ordem"] = df["faixa_recebimento"].apply(lambda x: ordem_faixa.index(x) if x in ordem_faixa else 99)
                 df = df.sort_values("ordem")
-                # Trocado de pizza pra barra horizontal (30/07) -- mesmo motivo
-                # do Painel de Backlog: 4 faixas de tamanho muito desigual não
-                # cabem numa fatia de pizza legível, e a ordem de gravidade
-                # (0-4 -> extravio) fica mais clara numa barra do que numa
-                # pizza. Cartão é estreito nessa aba, por isso fonte menor.
                 pct_dsp = 100 * df["n"] / df["n"].sum()
                 rotulos_dsp = [f"{n:,}".replace(",", ".") + f" ({p:.1f}%)" for n, p in zip(df["n"], pct_dsp)]
                 fig = go.Figure(go.Bar(
@@ -963,13 +970,12 @@ with tab_dsp:
                     marker_color=[cor_faixa.get(f, "#999") for f in df["faixa_recebimento"]],
                     text=rotulos_dsp, textposition="outside", cliponaxis=False,
                     textfont=dict(size=10),
-                    hovertemplate="%{y}<br>%{x:,} pacotes<extra></extra>",
                 ))
-                fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="#6B7A72", size=10),
-    height=280, margin=dict(l=10, r=75, t=5, b=5), showlegend=False,
-                                   xaxis=dict(visible=False),
-                                   yaxis=dict(autorange="reversed", automargin=True))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#6B7A72", size=10), height=280, margin=dict(l=10, r=75, t=5, b=5),
+                    showlegend=False, xaxis=dict(visible=False),
+                    yaxis=dict(autorange="reversed", automargin=True))
                 st.plotly_chart(fig, use_container_width=True)
 
             with r1c4, st.container(border=True):
@@ -981,9 +987,9 @@ with tab_dsp:
                 )
                 fig = go.Figure(go.Bar(x=df["grupo"], y=df["n"], marker_color=COR_EXTRAVIO,
                                         text=[f"{v:,}".replace(",", ".") for v in df["n"]], textposition="outside", cliponaxis=False))
-                fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="#6B7A72"),
-    height=260, margin=dict(l=10, r=10, t=5, b=5))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#6B7A72"), height=260, margin=dict(l=10, r=10, t=5, b=5))
                 st.plotly_chart(fig, use_container_width=True)
 
             st.write("")
@@ -997,9 +1003,9 @@ with tab_dsp:
                 )
                 fig = go.Figure(go.Bar(x=df["n"], y=df["grupo"], orientation="h", marker_color=COR_CRITICO,
                                         text=[f"{v:,}".replace(",", ".") for v in df["n"]], textposition="outside", cliponaxis=False))
-                fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="#6B7A72"),
-    height=460, margin=dict(l=10, r=65, t=5, b=5))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#6B7A72"), height=460, margin=dict(l=10, r=65, t=5, b=5))
                 fig.update_yaxes(autorange="reversed", automargin=True)
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -1012,14 +1018,197 @@ with tab_dsp:
                 )
                 fig = go.Figure(go.Bar(x=df["n"], y=df["grupo"], orientation="h", marker_color=ANJUN_GREEN,
                                         text=[f"{v:,}".replace(",", ".") for v in df["n"]], textposition="outside", cliponaxis=False))
-                fig.update_layout(                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="#6B7A72"),
-    height=460, margin=dict(l=10, r=65, t=5, b=5))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#6B7A72"), height=460, margin=dict(l=10, r=65, t=5, b=5))
                 fig.update_yaxes(autorange="reversed", automargin=True)
                 st.plotly_chart(fig, use_container_width=True)
 
             st.caption(
-                "Coluna: `entregador` (派送员) — ranking de quem tem mais backlog. Substitui o painel de Status "
-                "do modelo de referência, que tinha rótulos trocados com dados de cliente merchant. "
+                f"Coluna: `entregador` (派送员) — ranking de quem tem mais backlog. "
                 f"Todos os gráficos acima já filtram só a regional ({', '.join(UFS_REGIONAL)})."
             )
+
+# ===================== ABA COBRANÇA IATA =====================
+with tab_cobranca:
+    st.subheader("📋 Cobrança IATA — Lista de Waybills por Entregador")
+    st.caption(
+        "Lista operacional para cobrança diária dos DSPs. Mostra todos os pedidos em backlog "
+        "com ponto de entrega mapeado, agrupados por ponto e entregador, ordenados pelo maior atraso. "
+        "Filtre por supervisor para ver só a sua carteira."
+    )
+
+    # ── Filtros da aba Cobrança ──────────────────────────────────────
+    opcoes_sup_cob = run_query(
+        "SELECT DISTINCT supervisor FROM public.supervisores WHERE supervisor IS NOT NULL ORDER BY 1"
+    )["supervisor"].tolist()
+
+    col_f1, col_f2, col_f3 = st.columns([2, 2, 1])
+    with col_f1:
+        f_sup_cob = st.multiselect(
+            "Filtrar por Supervisor",
+            opcoes_sup_cob,
+            default=[],
+            key="cob_supervisor",
+            help="Deixe em branco para ver todos os supervisores.",
+        )
+    with col_f2:
+        f_min_dias = st.number_input(
+            "Atraso mínimo (dias)",
+            min_value=0, max_value=365, value=0, step=1,
+            key="cob_min_dias",
+            help="Filtra só pedidos com X dias ou mais de atraso.",
+        )
+    with col_f3:
+        apenas_anomalia = st.checkbox(
+            "Só 'Pedido com anomalia'",
+            value=False,
+            key="cob_anomalia",
+        )
+
+    # ── Carrega dados ────────────────────────────────────────────────
+    df_cob = _df_cobranca(f_sup_cob if f_sup_cob else None)
+
+    if df_cob.empty:
+        st.warning("Nenhum pedido encontrado com ponto de entrega mapeado no snapshot mais recente.")
+        st.stop()
+
+    # Converte tipos
+    df_cob["Dias atraso"] = pd.to_numeric(df_cob["Dias atraso"], errors="coerce")
+
+    # Aplica filtros adicionais
+    if f_min_dias > 0:
+        df_cob = df_cob[df_cob["Dias atraso"].fillna(0) >= f_min_dias]
+    if apenas_anomalia:
+        df_cob = df_cob[df_cob["Status do pacote"].str.contains("anomalia", case=False, na=False)]
+
+    if df_cob.empty:
+        st.warning("Nenhum pedido com esses filtros.")
+        st.stop()
+
+    # Adiciona coluna de urgência (texto, para exibição)
+    df_cob["Urgência"] = df_cob["Dias atraso"].apply(lambda d: _urgencia_label(d)[0])
+
+    # ── KPIs rápidos ─────────────────────────────────────────────────
+    total_cob = len(df_cob)
+    criticos_cob = len(df_cob[df_cob["Dias atraso"].fillna(0) >= 30])
+    pontos_cob = df_cob["Ponto (IATA)"].nunique()
+    entregadores_cob = df_cob["Entregador"].nunique()
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total de pedidos", total_cob)
+    k2.metric("Críticos (30+ dias)", criticos_cob,
+              delta=f"{100*criticos_cob/total_cob:.0f}% do total" if total_cob else "0%",
+              delta_color="inverse")
+    k3.metric("Pontos (IATAs)", pontos_cob)
+    k4.metric("Entregadores distintos", entregadores_cob)
+
+    st.divider()
+
+    # ── Resumo por ponto ─────────────────────────────────────────────
+    st.markdown('<div class="section-title">📍 Resumo por Ponto (IATA)</div>', unsafe_allow_html=True)
+
+    resumo_ponto = (
+        df_cob.groupby("Ponto (IATA)")
+        .agg(
+            Supervisor=("Supervisor", "first"),
+            Total=("Waybill", "count"),
+            Criticos=("Dias atraso", lambda x: (x.fillna(0) >= 30).sum()),
+            Mais_antigo=("Dias atraso", lambda x: x.max()),
+        )
+        .reset_index()
+        .sort_values("Total", ascending=False)
+        .rename(columns={"Criticos": "Críticos (30+d)", "Mais_antigo": "Mais antigo (dias)"})
+    )
+    st.dataframe(resumo_ponto, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Lista completa agrupada por ponto → entregador ───────────────
+    st.markdown('<div class="section-title">🎯 Waybills por Entregador (para cobrança)</div>', unsafe_allow_html=True)
+    st.caption("Expandido por ponto. Clique no cabeçalho da coluna para reordenar.")
+
+    pontos_disponiveis = sorted(df_cob["Ponto (IATA)"].dropna().unique())
+
+    for ponto in pontos_disponiveis:
+        df_ponto = df_cob[df_cob["Ponto (IATA)"] == ponto].copy()
+        supervisor_ponto = df_ponto["Supervisor"].dropna().iloc[0] if not df_ponto["Supervisor"].dropna().empty else "—"
+        total_ponto = len(df_ponto)
+        critico_ponto = len(df_ponto[df_ponto["Dias atraso"].fillna(0) >= 14])
+        mais_antigo = int(df_ponto["Dias atraso"].max()) if not df_ponto["Dias atraso"].isna().all() else "—"
+
+        label_critico = f"🔴" if critico_ponto == total_ponto else f"🟠" if critico_ponto > total_ponto * 0.5 else "🟡"
+
+        with st.expander(
+            f"{label_critico} **{ponto}** — {total_ponto} pedido(s) · {critico_ponto} crítico(s) · mais antigo: {mais_antigo}d · Supervisor: {supervisor_ponto}",
+            expanded=(total_ponto >= 3),
+        ):
+            # Colunas relevantes para cobrança
+            colunas_exibir = [
+                "Entregador", "Waybill", "Urgência",
+                "Dias atraso", "Prazo", "Último rastreio",
+                "Cidade", "UF", "Status do pacote",
+            ]
+            df_show = df_ponto[colunas_exibir].sort_values("Dias atraso", ascending=False, na_position="last")
+
+            st.dataframe(
+                df_show,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Waybill": st.column_config.TextColumn("Waybill", width="medium"),
+                    "Urgência": st.column_config.TextColumn("Urgência", width="medium"),
+                    "Dias atraso": st.column_config.NumberColumn("Dias atraso", format="%d"),
+                    "Prazo": st.column_config.DatetimeColumn("Prazo", format="DD/MM/YYYY"),
+                    "Último rastreio": st.column_config.DatetimeColumn("Último rastreio", format="DD/MM HH:mm"),
+                },
+            )
+
+            # Export individual por ponto
+            csv_ponto = df_show.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label=f"⬇️ Baixar CSV — {ponto}",
+                data=csv_ponto,
+                file_name=f"cobranca_{ponto}_{datetime.now():%Y%m%d}.csv",
+                mime="text/csv",
+                key=f"dl_{ponto}",
+            )
+
+    st.divider()
+
+    # ── Export completo ───────────────────────────────────────────────
+    st.markdown('<div class="section-title">⬇️ Export Completo</div>', unsafe_allow_html=True)
+    col_exp1, col_exp2 = st.columns(2)
+
+    with col_exp1:
+        csv_completo = df_cob.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="⬇️ Baixar CSV completo (todos os pontos)",
+            data=csv_completo,
+            file_name=f"cobranca_todos_pontos_{datetime.now():%Y%m%d}.csv",
+            mime="text/csv",
+            key="dl_completo",
+        )
+
+    with col_exp2:
+        # Export por entregador: um bloco de texto copiável para colar no WhatsApp/Telegram
+        linhas_msg = []
+        for ponto, grp_ponto in df_cob.groupby("Ponto (IATA)"):
+            linhas_msg.append(f"\n📍 *{ponto}*")
+            for entregador, grp_ent in grp_ponto.groupby("Entregador"):
+                waybills = grp_ent["Waybill"].tolist()
+                dias_max = grp_ent["Dias atraso"].max()
+                dias_str = f"{int(dias_max)}d" if not pd.isna(dias_max) else "s/ prazo"
+                linhas_msg.append(f"  👤 {entregador} ({len(waybills)} pedido(s) · max {dias_str})")
+                for wb in waybills:
+                    linhas_msg.append(f"    • {wb}")
+        texto_msg = "\n".join(linhas_msg)
+
+        st.download_button(
+            label="📱 Baixar lista .txt (para WhatsApp/grupos)",
+            data=texto_msg.encode("utf-8"),
+            file_name=f"cobranca_whatsapp_{datetime.now():%Y%m%d}.txt",
+            mime="text/plain",
+            key="dl_whatsapp",
+        )
+        st.caption("Formato pronto para colar no grupo do DSP: ponto → entregador → waybills.")
