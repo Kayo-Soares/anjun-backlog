@@ -387,9 +387,11 @@ def _df_hub(supervisor_filtro=None):
         "  b.motivo_da_ocorrencia                    AS \"Motivo (raw)\","
         "  (CURRENT_DATE - TO_DATE("
         "      LEFT(b.horario_em_que_deve_ser_entregue, 10), 'YYYY-MM-DD'"
-        "  ))                                        AS \"Dias atraso\""
+        "  ))                                        AS \"Dias atraso\","
+        "  COALESCE(ba.faixa_recebimento, 'Sem faixa') AS \"Faixa\""
         "  FROM public.backlog b"
         "  LEFT JOIN public.supervisores s ON s.ponto = b.ponto_de_entrada"
+        "  LEFT JOIN public.backlog_atual ba ON ba.numero_do_waybill = b.numero_do_waybill"
         "  WHERE b.data_snapshot = (SELECT MAX(data_snapshot) FROM public.backlog)"
         "    AND b.ponto_de_entrega IS NULL"
         "    AND b.ponto_de_entrada IS NOT NULL"
@@ -433,10 +435,13 @@ def _df_cobranca(supervisor_filtro=None):
             (CURRENT_DATE - TO_DATE(
                 LEFT(b.horario_em_que_deve_ser_entregue, 10), 'YYYY-MM-DD'
             ))                                          AS "Dias atraso",
-            b.data_snapshot                             AS "Snapshot"
+            b.data_snapshot                             AS "Snapshot",
+            COALESCE(ba.faixa_recebimento, 'Sem faixa') AS "Faixa"
         FROM public.backlog b
         LEFT JOIN public.supervisores s
             ON s.ponto = b.ponto_de_entrega
+        LEFT JOIN public.backlog_atual ba
+            ON ba.numero_do_waybill = b.numero_do_waybill
         WHERE b.data_snapshot = (SELECT MAX(data_snapshot) FROM public.backlog)
           AND b.ponto_de_entrega IS NOT NULL
           {filtro_supervisor}
@@ -1113,7 +1118,7 @@ with tab_cobranca:
         "SELECT DISTINCT supervisor FROM public.supervisores WHERE supervisor IS NOT NULL ORDER BY 1"
     )["supervisor"].tolist()
 
-    col_f1, col_f2, col_f3, col_f4 = st.columns([2, 1, 1, 2])
+    col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns([2, 2, 1, 1, 2])
     with col_f1:
         f_sup_cob = st.multiselect(
             "Filtrar por Supervisor",
@@ -1123,20 +1128,28 @@ with tab_cobranca:
             help="Deixe em branco para ver todos os supervisores.",
         )
     with col_f2:
-        f_min_dias = st.number_input(
-            "Atraso mínimo (dias)",
-            min_value=0, max_value=365, value=0, step=1,
-            key="cob_min_dias",
-            help="Filtra só pedidos com X dias ou mais de atraso.",
+        f_faixa_cob = st.multiselect(
+            "Faixa de recebimento",
+            ["0 a 4 dias", "05 a 13 dias", "14 a 20 dias (Crítico)", "Mais de 20 (Extravio)"],
+            default=[],
+            key="cob_faixa",
+            help="Filtra pela faixa do painel de backlog (tempo desde o inbound no ponto).",
         )
     with col_f3:
+        f_min_dias = st.number_input(
+            "Atraso mín. (dias)",
+            min_value=0, max_value=365, value=0, step=1,
+            key="cob_min_dias",
+            help="Filtra só pedidos com X dias ou mais de atraso pelo prazo.",
+        )
+    with col_f4:
         apenas_anomalia = st.checkbox(
             "Só anomalia",
             value=False,
             key="cob_anomalia",
             help="Filtra só status 'Pedido com anomalia'.",
         )
-    with col_f4:
+    with col_f5:
         prazo_resposta = st.text_input(
             "Prazo de resposta (para mensagem)",
             value="18h de hoje",
@@ -1152,6 +1165,9 @@ with tab_cobranca:
     # Converte e aplica filtros comuns
     for df in [df_cob, df_hub]:
         df["Dias atraso"] = pd.to_numeric(df["Dias atraso"], errors="coerce")
+    if f_faixa_cob:
+        df_cob = df_cob[df_cob["Faixa"].isin(f_faixa_cob)]
+        df_hub = df_hub[df_hub["Faixa"].isin(f_faixa_cob)]
     if f_min_dias > 0:
         df_cob = df_cob[df_cob["Dias atraso"].fillna(0) >= f_min_dias]
         df_hub = df_hub[df_hub["Dias atraso"].fillna(0) >= f_min_dias]
