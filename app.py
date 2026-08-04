@@ -1232,7 +1232,7 @@ with tab_cobranca:
                     )
                     st.warning(f"🚨 **{alertas_p} pedido(s) com motivo crítico:** {resumo_alert}")
 
-                cols_base = ["Waybill", "Urgência", "Dias atraso", "Dias no hub", "Motivo da ocorrência",
+                cols_base = ["Waybill", "Urgência", "Dias atraso", "Motivo da ocorrência",
                              "Prazo", "Último rastreio", "Cidade", "UF", "Status" if col_entregador is None else "Status do pacote"]
                 if col_entregador:
                     cols_base = [col_entregador] + cols_base
@@ -1248,8 +1248,6 @@ with tab_cobranca:
                         "Urgência": st.column_config.TextColumn("Urgência", width="medium"),
                         "Motivo da ocorrência": st.column_config.TextColumn("Motivo da ocorrência", width="large"),
                         "Dias atraso": st.column_config.NumberColumn("Dias atraso", format="%d"),
-                        "Dias no hub": st.column_config.NumberColumn("Dias no hub", format="%d",
-                            help="Dias desde que o pacote chegou no ponto (inbound). Mede represamento no DSP."),
                         "Prazo": st.column_config.DatetimeColumn("Prazo", format="DD/MM/YYYY"),
                         "Último rastreio": st.column_config.DatetimeColumn("Último rastreio", format="DD/MM HH:mm"),
                     },
@@ -1350,20 +1348,12 @@ with tab_cobranca:
                     Total=("Waybill", "count"),
                     Criticos=("Dias atraso", lambda x: (x.fillna(0) >= 14).sum()),
                     Mais_antigo=("Dias atraso", lambda x: x.max()),
-                    Media_hub=("Dias no hub", lambda x: round(x.dropna().mean(), 1) if x.dropna().any() else None),
-                    Max_hub=("Dias no hub", lambda x: x.max()),
                 )
                 .reset_index()
                 .sort_values("Total", ascending=False)
-                .rename(columns={
-                    "Criticos": "Críticos (14+d)",
-                    "Mais_antigo": "Mais antigo p/ prazo (d)",
-                    "Media_hub": "Média dias no hub",
-                    "Max_hub": "Máx dias no hub",
-                })
+                .rename(columns={"Criticos": "Críticos (14+d)", "Mais_antigo": "Mais antigo (dias)"})
             )
             st.markdown('<div class="section-title">📍 Resumo por Ponto</div>', unsafe_allow_html=True)
-            st.caption("'Dias no hub' = tempo desde o inbound no ponto. 'Mais antigo p/ prazo' = atraso pelo compromisso com o cliente.")
             st.dataframe(resumo_hub, use_container_width=True, hide_index=True)
             st.divider()
             _render_por_ponto(df_hub_parado, "Ponto (IATA)", col_entregador=None, prefixo_key="hub_parado")
