@@ -1067,7 +1067,7 @@ with tab_cobranca:
         "SELECT DISTINCT supervisor FROM public.supervisores WHERE supervisor IS NOT NULL ORDER BY 1"
     )["supervisor"].tolist()
 
-    col_f1, col_f2, col_f3 = st.columns([2, 2, 1])
+    col_f1, col_f2, col_f3, col_f4 = st.columns([2, 1, 1, 2])
     with col_f1:
         f_sup_cob = st.multiselect(
             "Filtrar por Supervisor",
@@ -1088,6 +1088,13 @@ with tab_cobranca:
             "Só 'Pedido com anomalia'",
             value=False,
             key="cob_anomalia",
+        )
+    with col_f4:
+        prazo_resposta = st.text_input(
+            "Prazo de resposta (para mensagem)",
+            value="18h de hoje",
+            key="cob_prazo_resposta",
+            help="Aparece no rodapé da mensagem de WhatsApp.",
         )
 
     # ── Carrega dados ────────────────────────────────────────────────
@@ -1233,21 +1240,51 @@ with tab_cobranca:
         )
 
     with col_exp2:
-        # Export por entregador: um bloco de texto copiável para colar no WhatsApp/Telegram
+        # ── Geração da mensagem de WhatsApp ──────────────────────────
+        # Melhoria 2: críticos separados dos normais por entregador
+        # Melhoria 3: atraso individual por waybill
+        # Melhoria 4: rodapé com prazo de resposta e instrução clara
         linhas_msg = []
+
         for ponto, grp_ponto in df_cob.groupby("Ponto (IATA)"):
-            linhas_msg.append(f"\n📍 *{ponto}*")
+            supervisor_msg = grp_ponto["Supervisor"].dropna().iloc[0] if not grp_ponto["Supervisor"].dropna().empty else "—"
+            total_ponto_msg = len(grp_ponto)
+            linhas_msg.append(f"\n📍 *{ponto}* — {total_ponto_msg} pedido(s) | Sup: {supervisor_msg}")
+
             for entregador, grp_ent in grp_ponto.groupby("Entregador"):
-                waybills = grp_ent["Waybill"].tolist()
                 dias_max = grp_ent["Dias atraso"].max()
                 dias_str = f"{int(dias_max)}d" if not pd.isna(dias_max) else "s/ prazo"
-                linhas_msg.append(f"  👤 {entregador} ({len(waybills)} pedido(s) · max {dias_str})")
-                for _, row in grp_ent.iterrows():
-                    motivo_raw = row.get("Motivo (raw)", "")
-                    eh_alerta = str(motivo_raw).strip() in MOTIVOS_ALERTA
-                    motivo_fmt = MOTIVOS_ALERTA.get(str(motivo_raw).strip(), "") if eh_alerta else ""
-                    sufixo = f" ← {motivo_fmt}" if motivo_fmt else ""
-                    linhas_msg.append(f"    • {row['Waybill']}{sufixo}")
+                total_ent = len(grp_ent)
+                linhas_msg.append(f"\n  👤 *{entregador}* — {total_ent} pedido(s) · max {dias_str}")
+
+                # Separar críticos (motivo de alerta) dos demais
+                alertas_ent = grp_ent[grp_ent["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys())]
+                normais_ent = grp_ent[~grp_ent["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys())]
+
+                # Melhoria 2: críticos primeiro, com seção própria
+                if not alertas_ent.empty:
+                    linhas_msg.append("    ⚠️ *ATENÇÃO — casos críticos:*")
+                    for _, row in alertas_ent.sort_values("Dias atraso", ascending=False, na_position="last").iterrows():
+                        motivo_fmt = MOTIVOS_ALERTA.get(str(row["Motivo (raw)"]).strip(), "")
+                        dias_wb = f"{int(row['Dias atraso'])}d" if not pd.isna(row["Dias atraso"]) else "s/ prazo"
+                        # Melhoria 3: atraso por waybill
+                        linhas_msg.append(f"    🚨 {row['Waybill']} · {dias_wb} · {motivo_fmt}")
+
+                # Pedidos normais
+                if not normais_ent.empty:
+                    if not alertas_ent.empty:
+                        linhas_msg.append("    ─────────────────")
+                    for _, row in normais_ent.sort_values("Dias atraso", ascending=False, na_position="last").iterrows():
+                        dias_wb = f"{int(row['Dias atraso'])}d" if not pd.isna(row["Dias atraso"]) else "s/ prazo"
+                        # Melhoria 3: atraso por waybill
+                        linhas_msg.append(f"    • {row['Waybill']} · {dias_wb}")
+
+        # Melhoria 4: rodapé com instrução e prazo
+        prazo_msg = prazo_resposta.strip() or "18h de hoje"
+        linhas_msg.append(f"\n{'─'*35}")
+        linhas_msg.append(f"⏰ Aguardo posicionamento até *{prazo_msg}*.")
+        linhas_msg.append("Confirme o recebimento e informe o status de cada pedido listado.")
+
         texto_msg = "\n".join(linhas_msg)
 
         st.download_button(
@@ -1257,4 +1294,8 @@ with tab_cobranca:
             mime="text/plain",
             key="dl_whatsapp",
         )
-        st.caption("Formato pronto para colar no grupo do DSP: ponto → entregador → waybills.")
+        st.caption(
+            "Formato para o grupo do DSP: ponto → entregador → "
+            "casos críticos primeiro (🚨) → pedidos normais (•) com dias de atraso individuais → "
+            "rodapé com prazo de resposta."
+        )
