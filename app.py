@@ -61,6 +61,17 @@ MOTIVOS_JA_RESOLVIDOS = [
     "Perda confirmada - Aguardando indenização",
     "Perda confirmada-Fake delivery",
     "Pacote não pertence à Base",
+    "Pacote avariado – Retorno",
+    "Pacote roubado",
+]
+
+# Motivos excluídos da visão de cobrança IATA: já têm processo próprio
+# (indenização, sinistro) e não devem aparecer na fila operacional.
+MOTIVOS_EXCLUIR_COBRANCA = [
+    "Perda confirmada-Fake delivery",
+    "Perda confirmada - Aguardando indenização",
+    "Pacote avariado – Retorno",
+    "Pacote roubado",
 ]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -344,12 +355,18 @@ def _urgencia_label(dias):
 
 # Motivos que exigem atenção especial — sinalização visual diferenciada
 MOTIVOS_ALERTA = {
-    "Pacote roubado":                          "🚨 Pacote roubado",
+    # Segurança (processo de B.O. / sinistro — não aparecem na cobrança IATA)
     "O pacote foi interceptado":               "🚨 Interceptado",
-    "Perda confirmada-Fake delivery":          "⚠️ Fake delivery",
-    "Perda confirmada - Aguardando indenização": "⚠️ Perda confirmada",
+    # Operacional — aparecem na cobrança e exigem ação do DSP
     "Local de area de risco":                  "⚠️ Área de risco",
-    "Pacote avariado – Retorno":               "📦 Avariado",
+    "Cliente ausente":                         "🔄 Cliente ausente",
+    "Endereço de destinário errado":           "🔄 Endereço errado",
+    "Endereço fora da rota":                   "🔄 Fora da rota",
+    "Recusado pelo cliente":                   "🔄 Recusado",
+    "Endereço fechado - greve/paralização/férias coletivas/banlanço": "🔄 End. fechado",
+    "Veículo quebrado":                        "🔄 Veículo quebrado",
+    "Entrega atrasada pelas condições climáticas": "🔄 Clima",
+    "Feriado local e reentrega em breve":      "🔄 Feriado",
 }
 
 
@@ -1165,6 +1182,11 @@ with tab_cobranca:
     # Converte e aplica filtros comuns
     for df in [df_cob, df_hub]:
         df["Dias atraso"] = pd.to_numeric(df["Dias atraso"], errors="coerce")
+
+    # Remove motivos que já têm processo próprio (indenização/sinistro)
+    df_cob = df_cob[~df_cob["Motivo (raw)"].isin(MOTIVOS_EXCLUIR_COBRANCA)]
+    df_hub = df_hub[~df_hub["Motivo (raw)"].isin(MOTIVOS_EXCLUIR_COBRANCA)]
+
     if f_faixa_cob:
         df_cob = df_cob[df_cob["Faixa"].isin(f_faixa_cob)]
         df_hub = df_hub[df_hub["Faixa"].isin(f_faixa_cob)]
