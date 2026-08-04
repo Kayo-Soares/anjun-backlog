@@ -178,7 +178,10 @@ def get_connection():
 def run_query(sql: str, params=None) -> pd.DataFrame:
     conn = get_connection()
     try:
-        return pd.read_sql(sql, conn, params=params)
+        # Passa params só se não for None nem dict vazio -- psycopg2 falha
+        # com dict vazio quando a query não tem placeholders
+        effective_params = params if params else None
+        return pd.read_sql(sql, conn, params=effective_params)
     except Exception:
         conn.rollback()
         raise
@@ -366,11 +369,11 @@ def _df_hub(supervisor_filtro=None):
       - 'Em rota de entrega': saiu para rota mas sem entregador registrado
       - 'Pedido com anomalia': falhou sem entregador nominado
     """
-    params = {}
+    params = None
     filtro_supervisor = ""
     if supervisor_filtro:
+        params = {"supervisores": supervisor_filtro}
         filtro_supervisor = "AND s.supervisor = ANY(%(supervisores)s)"
-        params["supervisores"] = supervisor_filtro
 
     sql = f"""
         SELECT
