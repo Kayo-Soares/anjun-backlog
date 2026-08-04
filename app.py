@@ -27,6 +27,10 @@ NOTA (04/08): adicionada aba "Cobrança IATA" com lista completa de
 waybills por ponto/entregador, filtros interativos, indicador de
 urgência e export CSV -- voltada para cobrança operacional dos DSPs
 (carteira ex-Helson e futuramente qualquer supervisor configurável).
+
+NOTA (04/08 v2): adicionada coluna "Motivo da ocorrência" na aba
+Cobrança IATA, incluindo sinalização visual de casos críticos como
+roubo, interceptação, fake delivery e perda confirmada.
 --------------------------------------------------------------------
 """
 
@@ -335,11 +339,30 @@ def _urgencia_label(dias):
     return f"⏳ dentro do prazo ({abs(dias)}d)", "urgencia-baixo"
 
 
+# Motivos que exigem atenção especial — sinalização visual diferenciada
+MOTIVOS_ALERTA = {
+    "Pacote roubado":                          "🚨 Pacote roubado",
+    "O pacote foi interceptado":               "🚨 Interceptado",
+    "Perda confirmada-Fake delivery":          "⚠️ Fake delivery",
+    "Perda confirmada - Aguardando indenização": "⚠️ Perda confirmada",
+    "Local de area de risco":                  "⚠️ Área de risco",
+    "Pacote avariado – Retorno":               "📦 Avariado",
+}
+
+
+def _formatar_motivo(motivo):
+    """Retorna o motivo com prefixo de alerta quando aplicável."""
+    if not motivo or pd.isna(motivo):
+        return "—"
+    return MOTIVOS_ALERTA.get(str(motivo).strip(), str(motivo))
+
+
 def _df_cobranca(supervisor_filtro=None):
     """
     Busca no banco todos os pedidos em backlog do snapshot mais recente,
     filtrados pelos pontos de um supervisor específico (ou todos, se None).
-    Retorna DataFrame pronto para exibição.
+    Retorna DataFrame pronto para exibição, incluindo motivo da ocorrência
+    com sinalização visual para casos críticos (roubo, interceptação, etc).
     """
     params = {"uf_regional": UFS_REGIONAL}
     filtro_supervisor = ""
@@ -359,6 +382,7 @@ def _df_cobranca(supervisor_filtro=None):
             b.ultimo_data_de_rastreio                   AS "Último rastreio",
             b.ultimo_rastreio                           AS "Último status",
             b.status_do_pacote                          AS "Status do pacote",
+            b.motivo_da_ocorrencia                      AS "Motivo (raw)",
             (CURRENT_DATE - TO_DATE(
                 LEFT(b.horario_em_que_deve_ser_entregue, 10), 'YYYY-MM-DD'
             ))                                          AS "Dias atraso",
@@ -1089,19 +1113,26 @@ with tab_cobranca:
     # Adiciona coluna de urgência (texto, para exibição)
     df_cob["Urgência"] = df_cob["Dias atraso"].apply(lambda d: _urgencia_label(d)[0])
 
+    # Formata motivo com prefixo de alerta
+    df_cob["Motivo da ocorrência"] = df_cob["Motivo (raw)"].apply(_formatar_motivo)
+
     # ── KPIs rápidos ─────────────────────────────────────────────────
     total_cob = len(df_cob)
     criticos_cob = len(df_cob[df_cob["Dias atraso"].fillna(0) >= 30])
     pontos_cob = df_cob["Ponto (IATA)"].nunique()
     entregadores_cob = df_cob["Entregador"].nunique()
+    alertas_cob = df_cob["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys()).sum()
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Total de pedidos", total_cob)
     k2.metric("Críticos (30+ dias)", criticos_cob,
               delta=f"{100*criticos_cob/total_cob:.0f}% do total" if total_cob else "0%",
               delta_color="inverse")
     k3.metric("Pontos (IATAs)", pontos_cob)
     k4.metric("Entregadores distintos", entregadores_cob)
+    k5.metric("🚨 Roubos / Perdas / Risco", alertas_cob,
+              delta="requer ação imediata" if alertas_cob > 0 else "nenhum",
+              delta_color="inverse" if alertas_cob > 0 else "normal")
 
     st.divider()
 
@@ -1146,10 +1177,20 @@ with tab_cobranca:
             # Colunas relevantes para cobrança
             colunas_exibir = [
                 "Entregador", "Waybill", "Urgência",
-                "Dias atraso", "Prazo", "Último rastreio",
-                "Cidade", "UF", "Status do pacote",
+                "Dias atraso", "Motivo da ocorrência", "Prazo",
+                "Último rastreio", "Cidade", "UF", "Status do pacote",
             ]
             df_show = df_ponto[colunas_exibir].sort_values("Dias atraso", ascending=False, na_position="last")
+
+            # Aviso se houver casos críticos de motivo dentro do ponto
+            alertas_ponto = df_ponto["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys()).sum()
+            if alertas_ponto > 0:
+                motivos_encontrados = (
+                    df_ponto[df_ponto["Motivo (raw)"].isin(MOTIVOS_ALERTA.keys())]
+                    ["Motivo da ocorrência"].value_counts()
+                )
+                resumo = ", ".join(f"{m} ({n}x)" for m, n in motivos_encontrados.items())
+                st.warning(f"🚨 **{alertas_ponto} pedido(s) com motivo crítico:** {resumo}")
 
             st.dataframe(
                 df_show,
@@ -1158,6 +1199,7 @@ with tab_cobranca:
                 column_config={
                     "Waybill": st.column_config.TextColumn("Waybill", width="medium"),
                     "Urgência": st.column_config.TextColumn("Urgência", width="medium"),
+                    "Motivo da ocorrência": st.column_config.TextColumn("Motivo da ocorrência", width="large"),
                     "Dias atraso": st.column_config.NumberColumn("Dias atraso", format="%d"),
                     "Prazo": st.column_config.DatetimeColumn("Prazo", format="DD/MM/YYYY"),
                     "Último rastreio": st.column_config.DatetimeColumn("Último rastreio", format="DD/MM HH:mm"),
@@ -1200,8 +1242,12 @@ with tab_cobranca:
                 dias_max = grp_ent["Dias atraso"].max()
                 dias_str = f"{int(dias_max)}d" if not pd.isna(dias_max) else "s/ prazo"
                 linhas_msg.append(f"  👤 {entregador} ({len(waybills)} pedido(s) · max {dias_str})")
-                for wb in waybills:
-                    linhas_msg.append(f"    • {wb}")
+                for _, row in grp_ent.iterrows():
+                    motivo_raw = row.get("Motivo (raw)", "")
+                    eh_alerta = str(motivo_raw).strip() in MOTIVOS_ALERTA
+                    motivo_fmt = MOTIVOS_ALERTA.get(str(motivo_raw).strip(), "") if eh_alerta else ""
+                    sufixo = f" ← {motivo_fmt}" if motivo_fmt else ""
+                    linhas_msg.append(f"    • {row['Waybill']}{sufixo}")
         texto_msg = "\n".join(linhas_msg)
 
         st.download_button(
