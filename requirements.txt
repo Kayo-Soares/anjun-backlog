@@ -3,4 +3,4 @@ pandas==2.3.0
 openpyxl>=3.1
 psycopg2-binary==2.9.12
 plotly>=5.18
-starlette==0.41.3
+starlette==0.37.2
